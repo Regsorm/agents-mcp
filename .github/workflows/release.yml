@@ -1,0 +1,120 @@
+# Сборка готовых архивов agents-mcp для Windows и Linux и выкладка их в выпуск GitHub.
+# Запуск: публикация тега v* или вручную для уже существующего тега
+# (Actions → Release → Run workflow, поле tag) — код в обоих случаях берётся из тега.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Существующий тег выпуска, например v1.0.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: agents-mcp.exe
+            archive: agents-mcp-windows-x64.zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: agents-mcp
+            archive: agents-mcp-linux-x64.tar.gz
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Linux собирается через zig под glibc 2.30: бинарник с ubuntu-latest
+      # потребовал бы свежий glibc, а README обещает «не ниже 2.30».
+      - name: Install zig
+        if: runner.os == 'Linux'
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        if: runner.os == 'Linux'
+        run: cargo install cargo-zigbuild --version 0.22.3 --locked
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.30
+
+      - name: Check glibc requirement (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          max=$(objdump -T "target/${{ matrix.target }}/release/${{ matrix.binary }}" | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n | tail -1)
+          echo "наибольшая требуемая версия glibc: $max"
+          [ "$(printf '%s\n' "$max" GLIBC_2.30 | sort -t. -k2 -n | tail -1)" = GLIBC_2.30 ]
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}", LICENSE, README.md, README_EN.md, configs/agents-mcp.example.toml -DestinationPath "${{ matrix.archive }}"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          tar czf "${{ matrix.archive }}" -C "target/${{ matrix.target }}/release" "${{ matrix.binary }}" -C "$GITHUB_WORKSPACE" LICENSE README.md README_EN.md configs/agents-mcp.example.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: ${{ matrix.archive }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Выпуск уже есть (создан вручную или прошлым запуском) — архивы дополняются
+      # с заменой одноимённых, описание не трогается; нет — выпуск создаётся
+      # с описанием из сообщения тега.
+      - name: Publish to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" --verify-tag --title "agents-mcp ${TAG#v}" --notes-from-tag
+          fi
+          gh release upload "$TAG" artifacts/* --clobber
