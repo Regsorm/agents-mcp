@@ -1,0 +1,86 @@
+[package]
+name = "agents-mcp"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "MCP-сервер платформы специализированных LLM-агентов"
+authors = ["Regsorm"]
+
+[[bin]]
+name = "agents-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# MCP-протокол (stateless HTTP — фикс 404 Session not found)
+rmcp = { version = "1.3", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
+
+# HTTP-сервер
+axum = "0.8"
+
+# Сериализация
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1"
+
+# Конфиг
+toml = "0.8"
+
+# Логирование в stdout и отдельную SQLite-базу событий.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Ошибки
+anyhow = "1"
+thiserror = "2"
+
+# Утилиты
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+sysinfo = "0.32"
+
+# Загрузка .env: секреты (DSN/ключи) попадают в окружение процесса отсюда.
+# Нужно потому, что Task Scheduler не передаёт супервизору User-env, добавленные
+# после логина, — agents-mcp читает .env сам и не зависит от окружения родителя.
+dotenvy = "0.15"
+
+# Хранилище: встроенный SQLite (по умолчанию — файл базы создаётся сам) и
+# PostgreSQL (схема agents_mcp) — по адресу из [storage].task_store_dsn.
+# См. раздел «Хранилище» в README.
+tokio-postgres = "0.7"
+deadpool-postgres = "0.14"
+tokio-postgres-rustls = { version = "0.14", features = ["ring", "webpki-roots"] }
+
+# Встроенный SQLite для работы без внешней базы. bundled — SQLite собирается
+# вместе с проектом, отдельная библиотека в системе не нужна.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# Хеш для cache_key (День 2)
+sha2 = "0.10"
+
+# Сжатие structured context в events (День 2)
+zstd = "0.13"
+
+# Шаблонизатор prompt.md (День 2)
+tera = "1"
+
+# Trait-объекты с async fn для провайдеров (День 2-4)
+async-trait = "0.1"
+
+# HTTP-клиент для провайдеров OpenRouter и Anthropic (День 3).
+# default-features=false → без OpenSSL, rustls (упрощает musl cross-compile).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Hot-reload агентов (День 5).
+notify = "6"
+
+# Pre-generate session_id для shared-session claude-cli.
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
