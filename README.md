@@ -1,3 +1,11 @@
+<a href="https://infostart.ru/1c/articles/2789368/" title="Published on Infostart">
+  <img src="https://infostart.ru/bitrix/templates/sandbox_empty/assets/tpl/abo/img/logo.svg" alt="Infostart" height="32">
+</a>
+
+Published on Infostart: [agents-mcp — MCP-сервер узких ИИ-агентов: агент — папка, модель — строка в конфиге](https://infostart.ru/1c/articles/2789368/)
+
+---
+
 # agents-mcp
 
 Русский | [English](README_EN.md)
