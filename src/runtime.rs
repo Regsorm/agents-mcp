@@ -2787,25 +2787,47 @@ async fn read_call_outcome(
     }
 }
 
-/// Снять ```json ... ``` обрамление из ответа модели (если есть).
-/// Поддерживает варианты: ```json, ```javascript, ``` (без языка).
-/// Если codefence не найден — возвращает исходную строку.
+/// Достать JSON из ответа модели.
+///
+/// Обрамление ```json ... ``` снимается, даже когда перед ним стоит пояснение:
+/// модели пишут фразу вроде «Проверил три места» и только потом JSON. Раньше
+/// рамка снималась лишь с начала ответа, и готовая работа отвергалась из-за
+/// одной лишней строки текста (случай повторялся у DeepSeek Flash и у Opus).
+/// Поддерживаются пометки языка json и javascript, а также рамка без пометки.
+/// Если рамки нет — берётся кусок от первой открывающей скобки до последней
+/// закрывающей. Ничего похожего на JSON не нашлось — возвращается сам ответ.
 fn strip_json_fences(s: &str) -> &str {
     let trimmed = s.trim();
-    let after_open = if let Some(rest) = trimmed.strip_prefix("```json") {
-        rest.trim_start()
-    } else if let Some(rest) = trimmed.strip_prefix("```javascript") {
-        rest.trim_start()
-    } else if let Some(rest) = trimmed.strip_prefix("```") {
-        rest.trim_start()
+    if let Some(open) = trimmed.find("```") {
+        let after_tag = &trimmed[open + 3..];
+        let body = after_tag
+            .strip_prefix("json")
+            .or_else(|| after_tag.strip_prefix("javascript"))
+            .unwrap_or(after_tag)
+            .trim_start();
+        let inner = match body.find("```") {
+            Some(close) => body[..close].trim(),
+            // Рамку открыли и не закрыли — берём всё, что после открытия.
+            None => body.trim_end(),
+        };
+        if !inner.is_empty() {
+            return inner;
+        }
+    }
+    json_span(trimmed).unwrap_or(trimmed)
+}
+
+/// Кусок от первой открывающей скобки до последней закрывающей.
+///
+/// Нужен для ответов, где JSON идёт без рамки, но с текстом вокруг.
+fn json_span(s: &str) -> Option<&str> {
+    let start = s.find(['{', '['])?;
+    let end = s.rfind(['}', ']'])?;
+    if end > start {
+        Some(s[start..=end].trim())
     } else {
-        return trimmed;
-    };
-    after_open
-        .trim_end()
-        .strip_suffix("```")
-        .map(|s| s.trim())
-        .unwrap_or(after_open)
+        None
+    }
 }
 
 /// Грубая оценка числа токенов по тексту (≈4 символа на токен). Не точная
@@ -3245,6 +3267,30 @@ mod tests {
     fn strip_fences_open_without_close() {
         // Открыли fence, но не закрыли — возвращаем что после открытия.
         assert_eq!(strip_json_fences("```json\n{\"a\":1}"), "{\"a\":1}");
+    }
+
+    #[test]
+    fn strip_fences_after_leading_text() {
+        // Модель пояснила ответ словами и только потом дала рамку с JSON.
+        assert_eq!(
+            strip_json_fences("Проверил три места.\n\n```json\n{\"a\":1}\n```"),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn strip_fences_json_without_fence_but_with_text() {
+        // Рамки нет, текст вокруг есть — берём кусок по скобкам.
+        assert_eq!(
+            strip_json_fences("Вот итог: {\"a\":1} — готово."),
+            "{\"a\":1}"
+        );
+    }
+
+    #[test]
+    fn strip_fences_text_without_json_returns_text() {
+        // Ничего похожего на JSON — ответ возвращается как есть.
+        assert_eq!(strip_json_fences("  просто текст  "), "просто текст");
     }
 
     #[test]
