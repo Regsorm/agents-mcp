@@ -95,6 +95,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Тег нужен локально: описание нового выпуска берётся из его аннотации.
+      # Этот шаг идёт первым — checkout чистит рабочий каталог и снёс бы
+      # уже скачанные архивы.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
