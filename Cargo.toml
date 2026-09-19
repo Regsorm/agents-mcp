@@ -1,6 +1,6 @@
 [package]
 name = "agents-mcp"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 license = "MIT"
 description = "MCP-сервер платформы специализированных LLM-агентов"
