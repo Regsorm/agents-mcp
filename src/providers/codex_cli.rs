@@ -53,6 +53,15 @@ use crate::proc_tree;
 
 use super::{mask_credentials, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
+/// Приносит ли агент собственные MCP-серверы в `extra_args`. Ключи вида
+/// `mcp_servers.<имя>.url=...` приходят из секции `[execution]` конфига агента
+/// парой аргументов `-c` + значение, поэтому смотрим на сами значения.
+fn zadany_svoi_servery(extra_args: &[String]) -> bool {
+    extra_args
+        .iter()
+        .any(|arg| arg.trim_start().starts_with("mcp_servers"))
+}
+
 /// Потолок на длину одной записи хода в базе. Ходов у codex единицы на вызов,
 /// но текст ответа модели приходит целиком в `item.completed` и на длинных
 /// разборах тянет на десятки килобайт — в диагностику столько не нужно.
@@ -179,15 +188,28 @@ impl LlmProvider for CodexCliProvider {
             std::env::temp_dir().join(format!("agents-mcp-codex-{}.txt", uuid::Uuid::new_v4()));
 
         let mut cmd = Command::new(&self.executable);
-        cmd.arg("exec")
-            .arg("-m")
-            .arg(&req.model)
-            .arg("-c")
-            .arg("mcp_servers={}")
-            .arg("--skip-git-repo-check")
+        cmd.arg("exec").arg("-m").arg(&req.model);
+
+        // Пустой список серверов ставим только тогда, когда агент не приносит
+        // своего: ключ `-c mcp_servers={}` затирает ВЕСЬ список из профиля
+        // CODEX_HOME, и точечные ключи (`mcp_servers.<имя>.url`), добавленные
+        // следом, его уже не восстанавливают — проверено живым прогоном
+        // 19.09.2026: инструменты code-index так и не появились у модели.
+        if !zadany_svoi_servery(&hints.extra_args) {
+            cmd.arg("-c").arg("mcp_servers={}");
+        }
+
+        cmd.arg("--skip-git-repo-check")
             // Поток событий: нужен для транскрипта и расхода токенов. Файл
             // ответа (`-o`) при этом пишется по-прежнему.
             .arg("--json");
+
+        // Рабочий каталог вызова (`cwd_template` агента) — ключом `-C`: для
+        // codex это корень, в котором он читает и правит файлы, и песочница
+        // `workspace-write` разрешает запись именно в него.
+        if let Some(cwd) = &hints.cwd {
+            cmd.arg("-C").arg(cwd);
+        }
 
         // Усилие рассуждений (`-c model_reasoning_effort="..."`) и путь к
         // схеме ответа (`--output-schema <файл>`) — из настроек агента, не из
@@ -456,6 +478,7 @@ impl LlmProvider for CodexCliProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ClaudeCliHints;
     use serde_json::json;
 
     #[test]
@@ -481,6 +504,110 @@ mod tests {
     #[test]
     fn raw_input_tokens_does_not_underflow() {
         assert_eq!(raw_input_tokens(10, 20), 0);
+    }
+
+    #[test]
+    fn svoi_servery_uznayutsya_po_klyuchu_mcp_servers() {
+        let svoi = vec![
+            "-c".to_string(),
+            "mcp_servers.code_index.url=\"http://127.0.0.1:8011/mcp\"".to_string(),
+        ];
+        assert!(zadany_svoi_servery(&svoi));
+
+        let chuzhie = vec![
+            "-c".to_string(),
+            "model_reasoning_effort=\"high\"".to_string(),
+        ];
+        assert!(!zadany_svoi_servery(&chuzhie));
+        assert!(!zadany_svoi_servery(&[]));
+    }
+
+    /// Агент со своими серверами не должен получать затирающий `mcp_servers={}`,
+    /// а рабочий каталог обязан уходить ключом `-C`: без первого у модели нет
+    /// инструментов code-index, без второго codex правит файлы не в том месте.
+    #[tokio::test]
+    async fn argv_uchityvaet_svoi_servery_i_rabochiy_katalog() {
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-codex-argv-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("каталог fake codex");
+        let source = dir.join("argv_cli.rs");
+        std::fs::write(
+            &source,
+            r#"fn main() {
+    use std::io::Read;
+    let args = std::env::args().collect::<Vec<_>>();
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input).unwrap();
+    let out = args.windows(2).find(|pair| pair[0] == "-o").unwrap()[1].clone();
+    std::fs::write(out, args[1..].join(" ")).unwrap();
+}"#,
+        )
+        .expect("исходник fake codex");
+        let executable = dir.join(if cfg!(windows) {
+            "argv_cli.exe"
+        } else {
+            "argv_cli"
+        });
+        let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = std::process::Command::new(rustc)
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .status()
+            .expect("запуск rustc");
+        assert!(compiled.success(), "fake codex должен собраться");
+
+        let provider = CodexCliProvider::new(executable, dir.clone(), 1, None, None);
+        let zapros = |hints: ClaudeCliHints| LlmRequest {
+            model: "fake-model".into(),
+            system_prompt: "prompt".into(),
+            user_input: String::new(),
+            temperature: 0.0,
+            max_tokens: 10,
+            top_p: None,
+            extra_body: serde_json::Map::new(),
+            timeout: Duration::from_secs(30),
+            cli_hints: Some(hints),
+            turn_sink: None,
+            fallback_skill_names: Vec::new(),
+            prompt_skill_names: Vec::new(),
+            skills: None,
+        };
+
+        let so_svoimi = provider
+            .complete(zapros(ClaudeCliHints {
+                cwd: Some(dir.clone()),
+                extra_args: vec![
+                    "-c".to_string(),
+                    "mcp_servers.code_index.url=\"http://127.0.0.1:8011/mcp\"".to_string(),
+                ],
+                ..Default::default()
+            }))
+            .await
+            .expect("вызов со своими серверами")
+            .content;
+        assert!(
+            !so_svoimi.contains("mcp_servers={}"),
+            "список серверов затёрт: {so_svoimi}"
+        );
+        assert!(so_svoimi.contains(" -C "), "нет ключа -C: {so_svoimi}");
+        assert!(
+            so_svoimi.contains(&dir.to_string_lossy().to_string()),
+            "рабочий каталог не передан: {so_svoimi}"
+        );
+
+        let bez_svoih = provider
+            .complete(zapros(ClaudeCliHints::default()))
+            .await
+            .expect("вызов без своих серверов")
+            .content;
+        assert!(
+            bez_svoih.contains("mcp_servers={}"),
+            "без своих серверов список обязан обнуляться: {bez_svoih}"
+        );
+        assert!(!bez_svoih.contains(" -C "), "лишний -C: {bez_svoih}");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
