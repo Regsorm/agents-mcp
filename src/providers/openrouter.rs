@@ -28,8 +28,8 @@ use crate::config::ModelPrice;
 
 use super::mcp_client;
 use super::tool_loop::{
-    self, clamp_tool_result, execute_tool_call, truncate_str, Transcript, ToolCallState,
-    DEFAULT_MAX_TOOL_TURNS,
+    self, clamp_tool_result, execute_tool_call, truncate_str, ToolCallInput, ToolCallState,
+    Transcript, DEFAULT_MAX_TOOL_TURNS,
 };
 use super::{pricing, ClaudeCliHints, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
@@ -59,6 +59,17 @@ pub struct OpenRouterProvider {
     active: Arc<AtomicUsize>,
 }
 
+pub(crate) struct OpenRouterOptions {
+    pub name: String,
+    pub api_key: String,
+    pub base_url: Option<String>,
+    pub referer: Option<String>,
+    pub proxy: Option<String>,
+    pub proxy_bypass: Option<String>,
+    pub max_concurrent: Option<u32>,
+    pub prices: BTreeMap<String, ModelPrice>,
+}
+
 struct ActiveCall(Arc<AtomicUsize>);
 
 impl Drop for ActiveCall {
@@ -68,17 +79,17 @@ impl Drop for ActiveCall {
 }
 
 impl OpenRouterProvider {
-    pub fn new(
-        name: impl Into<String>,
-        api_key: String,
-        base_url: Option<String>,
-        referer: Option<String>,
-        proxy: Option<String>,
-        proxy_bypass: Option<String>,
-        max_concurrent: Option<u32>,
-        prices: BTreeMap<String, ModelPrice>,
-    ) -> Self {
-        let name = name.into();
+    pub fn new(options: OpenRouterOptions) -> Self {
+        let OpenRouterOptions {
+            name,
+            api_key,
+            base_url,
+            referer,
+            proxy,
+            proxy_bypass,
+            max_concurrent,
+            prices,
+        } = options;
         let client = super::build_http_client(&name, proxy.as_deref(), proxy_bypass.as_deref());
         Self {
             name,
@@ -102,13 +113,11 @@ impl OpenRouterProvider {
             .ctx_window
             .get_or_init(|| async {
                 let url = format!("{}/props", self.base_url.trim_end_matches("/v1"));
-                let resp = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    self.client.get(&url).send(),
-                )
-                .await
-                .ok()?
-                .ok()?;
+                let resp =
+                    tokio::time::timeout(Duration::from_secs(5), self.client.get(&url).send())
+                        .await
+                        .ok()?
+                        .ok()?;
                 let body: Value = tokio::time::timeout(Duration::from_secs(5), resp.json())
                     .await
                     .ok()?
@@ -162,10 +171,17 @@ fn trim_history(messages: &mut [Value], keep_last: usize) -> usize {
         if m["role"].as_str() != Some("tool") {
             continue;
         }
-        let len = m["content"].as_str().map(|s| s.chars().count()).unwrap_or(0);
+        let len = m["content"]
+            .as_str()
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
         // Пометку ставим один раз: повторный проход не должен «вытеснять»
         // уже вытесненное и раздувать счётчик.
-        if len == 0 || m["content"].as_str().is_some_and(|s| s.starts_with("[вытеснено")) {
+        if len == 0
+            || m["content"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("[вытеснено"))
+        {
             continue;
         }
         m["content"] = Value::String(format!(
@@ -331,7 +347,11 @@ fn note_repeats(
         let entry = seen.entry(line.to_string()).or_insert((0, here, 0));
         // Разрыв больше порога — прошлые вхождения к нынешнему отношения не
         // имеют: это не петля, а возврат к той же мысли через страницу текста.
-        entry.0 = if here - entry.1 > LOOP_GAP_MAX { 1 } else { entry.0 + 1 };
+        entry.0 = if here - entry.1 > LOOP_GAP_MAX {
+            1
+        } else {
+            entry.0 + 1
+        };
         entry.1 = here;
         // Счётчик за весь ход разрывом не сбрасывается: медленная петля тем и
         // отличается, что между вхождениями лежат страницы текста.
@@ -425,7 +445,11 @@ fn sanitize_stream_model_name(model: &str) -> String {
             }
         })
         .collect();
-    if sanitized.is_empty() { "model".to_string() } else { sanitized }
+    if sanitized.is_empty() {
+        "model".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn cleanup_old_stream_files(dir: &std::path::Path, now: SystemTime) {
@@ -472,7 +496,10 @@ fn open_stream_files(
 ) -> (Option<std::fs::File>, Option<std::fs::File>) {
     let now = SystemTime::now();
     cleanup_old_stream_files(dir, now);
-    let timestamp_ms = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+    let timestamp_ms = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
     let model = sanitize_stream_model_name(model);
 
     for suffix in 0..=u32::MAX {
@@ -751,31 +778,47 @@ const LOOP_SKILL_MIN_RR: f64 = -5.0;
 /// применяется в ветке с неразобранным вызовом инструмента.
 const LOOP_NUDGE_TEMP: f32 = 0.2;
 
+struct ChatParams<'a> {
+    model: &'a str,
+    messages: &'a [Value],
+    tools: Option<&'a [Value]>,
+    temperature: f32,
+    max_tokens: Option<u32>,
+    top_p: Option<f32>,
+    extra: &'a serde_json::Map<String, Value>,
+}
+
+struct ResponseParts {
+    content: String,
+    finish_reason: String,
+    tokens_in: u32,
+    cached_in: u32,
+    tokens_out: u32,
+    cost_usd: Option<f64>,
+    reasoning: Option<String>,
+}
+
 impl OpenRouterProvider {
     /// Один HTTP-вызов chat/completions. Разбирает первый choice + usage.
     async fn chat_once_attempt(
         &self,
-        model: &str,
-        messages: &[Value],
-        tools: Option<&[Value]>,
-        temperature: f32,
-        max_tokens: Option<u32>,
-        top_p: Option<f32>,
-        extra: &serde_json::Map<String, Value>,
+        params: &ChatParams<'_>,
         timeout: Duration,
     ) -> Result<ChatTurn, LlmError> {
         let sink = stream_dir();
         let body = ChatRequest {
-            model,
-            messages,
-            temperature,
-            max_tokens,
-            top_p,
-            tools,
+            model: params.model,
+            messages: params.messages,
+            temperature: params.temperature,
+            max_tokens: params.max_tokens,
+            top_p: params.top_p,
+            tools: params.tools,
             usage: UsageOption { include: true },
             stream: sink.is_some(),
-            stream_options: sink.as_ref().map(|_| StreamOptions { include_usage: true }),
-            extra,
+            stream_options: sink.as_ref().map(|_| StreamOptions {
+                include_usage: true,
+            }),
+            extra: params.extra,
         };
 
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
@@ -806,10 +849,12 @@ impl OpenRouterProvider {
                 Ok(r) => r.map_err(map_reqwest_err)?,
             };
             if resp.status().as_u16() == 429 {
-                return Err(LlmError::RateLimitedRetry(retry_after_seconds(resp.headers())));
+                return Err(LlmError::RateLimitedRetry(retry_after_seconds(
+                    resp.headers(),
+                )));
             }
             let left = timeout.saturating_sub(started.elapsed());
-            let mut turn = self.read_stream(resp, model, &dir, left).await?;
+            let mut turn = self.read_stream(resp, params.model, &dir, left).await?;
             normalize_text_tool_calls(&self.name, &mut turn);
             return Ok(turn);
         }
@@ -849,7 +894,7 @@ impl OpenRouterProvider {
                 let cached = u.cached_in();
                 let cost = u.cost.or_else(|| {
                     pricing::openai_cost(
-                        self.prices.get(model),
+                        self.prices.get(params.model),
                         u.prompt_tokens,
                         cached,
                         u.completion_tokens,
@@ -860,14 +905,16 @@ impl OpenRouterProvider {
             None => (0, 0, 0, None),
         };
 
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::InvalidResponse(format!("{}: пустой choices", self.name)))?;
+        let choice =
+            parsed.choices.into_iter().next().ok_or_else(|| {
+                LlmError::InvalidResponse(format!("{}: пустой choices", self.name))
+            })?;
         let finish_reason = choice.finish_reason.unwrap_or_else(|| "unknown".into());
 
-        let reasoning = choice.message.reasoning_content.or(choice.message.reasoning);
+        let reasoning = choice
+            .message
+            .reasoning_content
+            .or(choice.message.reasoning);
         let mut turn = ChatTurn {
             content: choice.message.content,
             tool_calls: choice.message.tool_calls.unwrap_or_default(),
@@ -882,16 +929,9 @@ impl OpenRouterProvider {
         Ok(turn)
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn chat_once(
         &self,
-        model: &str,
-        messages: &[Value],
-        tools: Option<&[Value]>,
-        temperature: f32,
-        max_tokens: Option<u32>,
-        top_p: Option<f32>,
-        extra: &serde_json::Map<String, Value>,
+        params: ChatParams<'_>,
         timeout: Duration,
     ) -> Result<ChatTurn, LlmError> {
         let deadline = tokio::time::Instant::now() + timeout;
@@ -900,17 +940,12 @@ impl OpenRouterProvider {
             if left.is_zero() {
                 return Err(LlmError::Timeout);
             }
-            match self
-                .chat_once_attempt(
-                    model, messages, tools, temperature, max_tokens, top_p, extra, left,
-                )
-                .await
-            {
+            match self.chat_once_attempt(&params, left).await {
                 Err(LlmError::RateLimitedRetry(header_delay)) => {
                     let delay = header_delay.unwrap_or(2u64 << retry);
                     tracing::warn!(
                         provider = %self.name,
-                        model,
+                        model = params.model,
                         active = self.active.load(Ordering::SeqCst),
                         retry = retry + 1,
                         delay_sec = delay,
@@ -1156,8 +1191,12 @@ impl OpenRouterProvider {
                     if line_chars >= LOOP_LINE_CHARS_MAX {
                         let (word, n) = top_word(&reason_tail);
                         let head = truncate(reason_tail.trim_start(), 120);
-                        loop_hit =
-                            Some((head, n, "размышлении", long_line_reason(line_chars, &word, n)));
+                        loop_hit = Some((
+                            head,
+                            n,
+                            "размышлении",
+                            long_line_reason(line_chars, &word, n),
+                        ));
                         break 'stream;
                     }
                     if turn_chars >= TURN_CHARS_MAX {
@@ -1177,9 +1216,8 @@ impl OpenRouterProvider {
                                 )));
                             }
                             Some(idx) => idx as usize,
-                            None
-                                if tc["id"].as_str().is_some()
-                                    || tc["function"]["name"].as_str().is_some() =>
+                            None if tc["id"].as_str().is_some()
+                                || tc["function"]["name"].as_str().is_some() =>
                             {
                                 calls.len()
                             }
@@ -1225,7 +1263,11 @@ impl OpenRouterProvider {
             );
             // Хвост берём из того канала, где случилась петля: в нём и лежит то
             // место, на котором модель встала.
-            let source = if channel == "ответе" { &content } else { &reasoning };
+            let source = if channel == "ответе" {
+                &content
+            } else {
+                &reasoning
+            };
             return Err(LlmError::Loop {
                 provider: self.name.clone(),
                 channel: channel.to_string(),
@@ -1298,32 +1340,23 @@ impl OpenRouterProvider {
         Ok((tools, built.registry, built.stdio_pool))
     }
 
-    fn to_response(
-        &self,
-        content: String,
-        finish_reason: String,
-        tokens_in: u32,
-        cached_in: u32,
-        tokens_out: u32,
-        cost_usd: Option<f64>,
-        reasoning: Option<String>,
-    ) -> LlmResponse {
+    fn to_response(&self, parts: ResponseParts) -> LlmResponse {
         LlmResponse {
-            content,
-            tokens_in,
-            tokens_out,
-            cost_usd,
-            finish_reason,
-            reasoning,
+            content: parts.content,
+            tokens_in: parts.tokens_in,
+            tokens_out: parts.tokens_out,
+            cost_usd: parts.cost_usd,
+            finish_reason: parts.finish_reason,
+            reasoning: parts.reasoning,
             session_id: None,
             // Кеш префикса у OpenAI-совместимых провайдеров только читается:
             // отдельной операции «создать кеш» (и отдельной цены за неё, как у
             // Anthropic) тут нет, поэтому creation всегда 0. Провайдер, не
             // присылающий кеш-полей, даёт cached_in = 0 — тогда весь вход
             // ложится в raw, как было раньше.
-            raw_input_tokens: tokens_in.saturating_sub(cached_in),
+            raw_input_tokens: parts.tokens_in.saturating_sub(parts.cached_in),
             cache_creation_input_tokens: 0,
-            cache_read_input_tokens: cached_in,
+            cache_read_input_tokens: parts.cached_in,
             // Наполняется в complete() перед возвратом (из Transcript::take).
             transcript: Vec::new(),
         }
@@ -1389,13 +1422,15 @@ impl LlmProvider for OpenRouterProvider {
         if tools.is_empty() {
             let turn = self
                 .chat_once(
-                    &req.model,
-                    &messages,
-                    None,
-                    req.temperature,
-                    cap_tokens(req.max_tokens),
-                    req.top_p,
-                    &req.extra_body,
+                    ChatParams {
+                        model: &req.model,
+                        messages: &messages,
+                        tools: None,
+                        temperature: req.temperature,
+                        max_tokens: cap_tokens(req.max_tokens),
+                        top_p: req.top_p,
+                        extra: &req.extra_body,
+                    },
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                 )
                 .await?;
@@ -1421,15 +1456,15 @@ impl LlmProvider for OpenRouterProvider {
             } else {
                 turn.cost
             };
-            let mut resp = self.to_response(
-                turn.content.unwrap_or_default(),
-                turn.finish_reason,
-                tin,
-                turn.cached_in,
-                tout,
-                cost,
-                turn.reasoning,
-            );
+            let mut resp = self.to_response(ResponseParts {
+                content: turn.content.unwrap_or_default(),
+                finish_reason: turn.finish_reason,
+                tokens_in: tin,
+                cached_in: turn.cached_in,
+                tokens_out: tout,
+                cost_usd: cost,
+                reasoning: turn.reasoning,
+            });
             resp.transcript = transcript.take();
             return Ok(resp);
         }
@@ -1521,13 +1556,15 @@ impl LlmProvider for OpenRouterProvider {
             let turn_started = std::time::Instant::now();
             let turn = match self
                 .chat_once(
-                    &req.model,
-                    &messages,
-                    Some(&tools),
-                    temperature,
-                    cap_tokens(req.max_tokens),
-                    req.top_p,
-                    &req.extra_body,
+                    ChatParams {
+                        model: &req.model,
+                        messages: &messages,
+                        tools: Some(&tools),
+                        temperature,
+                        max_tokens: cap_tokens(req.max_tokens),
+                        top_p: req.top_p,
+                        extra: &req.extra_body,
+                    },
                     deadline.saturating_duration_since(tokio::time::Instant::now()),
                 )
                 .await
@@ -1567,11 +1604,16 @@ impl LlmProvider for OpenRouterProvider {
                     // же неразбираемый текст — три попытки лягут за миллисекунды.
                     // Убираем результаты инструментов и породивший их вызов;
                     // остальная работа агента сохраняется.
-                    while matches!(messages.last().and_then(|m| m["role"].as_str()), Some("tool")) {
+                    while matches!(
+                        messages.last().and_then(|m| m["role"].as_str()),
+                        Some("tool")
+                    ) {
                         messages.pop();
                     }
-                    if matches!(messages.last().and_then(|m| m["role"].as_str()), Some("assistant"))
-                    {
+                    if matches!(
+                        messages.last().and_then(|m| m["role"].as_str()),
+                        Some("assistant")
+                    ) {
                         messages.pop();
                     }
                     messages.push(json!({
@@ -1612,8 +1654,7 @@ impl LlmProvider for OpenRouterProvider {
                     // размышления встаёт первым.
                     let found = match &req.skills {
                         Some(sk) => {
-                            let catalog =
-                                sk.skill_catalog(&loop_query(&line, &tail), 5).await;
+                            let catalog = sk.skill_catalog(&loop_query(&line, &tail), 5).await;
                             pick_skill(&catalog, &skills_shown)
                         }
                         None => None,
@@ -1786,15 +1827,15 @@ impl LlmProvider for OpenRouterProvider {
             if turn.tool_calls.is_empty() {
                 transcript.write(&json!({"event": "final", "turn": turn_idx}));
                 // Финальный ответ.
-                let mut resp = self.to_response(
-                    turn.content.unwrap_or_default(),
-                    last_finish,
-                    total_in,
-                    total_cached_in,
-                    total_out,
-                    total_cost,
-                    turn.reasoning,
-                );
+                let mut resp = self.to_response(ResponseParts {
+                    content: turn.content.unwrap_or_default(),
+                    finish_reason: last_finish,
+                    tokens_in: total_in,
+                    cached_in: total_cached_in,
+                    tokens_out: total_out,
+                    cost_usd: total_cost,
+                    reasoning: turn.reasoning,
+                });
                 resp.transcript = transcript.take();
                 return Ok(resp);
             }
@@ -1842,14 +1883,16 @@ impl LlmProvider for OpenRouterProvider {
                 let tool_started = std::time::Instant::now();
                 let result = execute_tool_call(
                     &self.client,
-                    &self.name,
                     &mut mcp_tools,
-                    req.cli_hints.as_ref(),
                     &mut tool_state,
-                    &tc.function.name,
-                    &tc.function.arguments,
-                    parsed,
                     &mut temperature,
+                    ToolCallInput {
+                        provider: &self.name,
+                        hints: req.cli_hints.as_ref(),
+                        tool_name: &tc.function.name,
+                        raw_arguments: &tc.function.arguments,
+                        parsed_arguments: parsed,
+                    },
                 )
                 .await;
 
@@ -1936,7 +1979,10 @@ fn describe_messages(messages: &[Value]) -> Value {
     let mut sizes: Vec<(usize, &str, String)> = Vec::new();
     for m in messages {
         let role = m["role"].as_str().unwrap_or("?");
-        let len = m["content"].as_str().map(|s| s.chars().count()).unwrap_or(0);
+        let len = m["content"]
+            .as_str()
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
         let e = by_role.entry(role).or_insert((0, 0));
         e.0 += 1;
         e.1 += len;
@@ -2057,16 +2103,16 @@ mod tests {
     use super::*;
 
     fn test_provider(url: String) -> OpenRouterProvider {
-        OpenRouterProvider::new(
-            "fixture",
-            "synthetic-key".into(),
-            Some(url),
-            None,
-            None,
-            None,
-            None,
-            BTreeMap::new(),
-        )
+        OpenRouterProvider::new(OpenRouterOptions {
+            name: "fixture".into(),
+            api_key: "synthetic-key".into(),
+            base_url: Some(url),
+            referer: None,
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: None,
+            prices: BTreeMap::new(),
+        })
     }
 
     fn test_provider_with_price(url: String) -> OpenRouterProvider {
@@ -2080,21 +2126,21 @@ mod tests {
                 cache_write: None,
             },
         );
-        OpenRouterProvider::new(
-            "fixture",
-            "synthetic-key".into(),
-            Some(url),
-            None,
-            None,
-            None,
-            None,
+        OpenRouterProvider::new(OpenRouterOptions {
+            name: "fixture".into(),
+            api_key: "synthetic-key".into(),
+            base_url: Some(url),
+            referer: None,
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: None,
             prices,
-        )
+        })
     }
 
     fn test_temp_dir() -> std::path::PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("agents-mcp-openrouter-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("agents-mcp-openrouter-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -2118,8 +2164,12 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), 6, "каждый вызов создаёт отдельную пару файлов");
-        assert!(names.iter().all(|name| !name.chars().any(|ch| matches!(ch, ':' | '/' | '\\'))));
-        assert!(names.iter().any(|name| name.contains("qwen_qwen3-coder_free")));
+        assert!(names
+            .iter()
+            .all(|name| !name.chars().any(|ch| matches!(ch, ':' | '/' | '\\'))));
+        assert!(names
+            .iter()
+            .any(|name| name.contains("qwen_qwen3-coder_free")));
         assert!(names.iter().any(|name| name.contains("C__models_x.gguf")));
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2148,9 +2198,7 @@ mod tests {
     async fn test_stream(chunks: Vec<Vec<u8>>) -> reqwest::Response {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -2213,9 +2261,9 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::from(turns),
-        ));
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            turns,
+        )));
         let tool_results = std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::from(tool_results),
         ));
@@ -2225,9 +2273,7 @@ mod tests {
         let app = Router::new()
             .route(
                 "/props",
-                get(|| async {
-                    Json(json!({"default_generation_settings": {"n_ctx": 100_000}}))
-                }),
+                get(|| async { Json(json!({"default_generation_settings": {"n_ctx": 100_000}})) }),
             )
             .route(
                 "/chat/completions",
@@ -2279,9 +2325,7 @@ mod tests {
                     }
                 }),
             );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         TestApi {
@@ -2384,18 +2428,20 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider =
-            OpenRouterProvider::new(
-                "retry",
-                "key".into(),
-                Some(base),
-                None,
-                None,
-                None,
-                None,
-                BTreeMap::new(),
-            );
-        assert_eq!(provider.complete(test_request()).await.unwrap().content, "finished");
+        let provider = OpenRouterProvider::new(OpenRouterOptions {
+            name: "retry".into(),
+            api_key: "key".into(),
+            base_url: Some(base),
+            referer: None,
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: None,
+            prices: BTreeMap::new(),
+        });
+        assert_eq!(
+            provider.complete(test_request()).await.unwrap().content,
+            "finished"
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         task.abort();
 
@@ -2414,17 +2460,16 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider =
-            OpenRouterProvider::new(
-                "forbidden",
-                "key".into(),
-                Some(base),
-                None,
-                None,
-                None,
-                None,
-                BTreeMap::new(),
-            );
+        let provider = OpenRouterProvider::new(OpenRouterOptions {
+            name: "forbidden".into(),
+            api_key: "key".into(),
+            base_url: Some(base),
+            referer: None,
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: None,
+            prices: BTreeMap::new(),
+        });
         assert!(provider.complete(test_request()).await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         task.abort();
@@ -2456,16 +2501,16 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let provider = OpenRouterProvider::new(
-            "limited",
-            "key".into(),
-            Some(base),
-            None,
-            None,
-            None,
-            Some(1),
-            BTreeMap::new(),
-        );
+        let provider = OpenRouterProvider::new(OpenRouterOptions {
+            name: "limited".into(),
+            api_key: "key".into(),
+            base_url: Some(base),
+            referer: None,
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: Some(1),
+            prices: BTreeMap::new(),
+        });
         let (one, two) = tokio::join!(
             provider.complete(test_request()),
             provider.complete(test_request())
@@ -2509,8 +2554,7 @@ mod tests {
         let mut req = test_request();
         req.cli_hints = Some(ClaudeCliHints {
             mcp_config: Some(
-                json!({"mcpServers": {"fixture": {"url": format!("{base}/mcp")}}})
-                    .to_string(),
+                json!({"mcpServers": {"fixture": {"url": format!("{base}/mcp")}}}).to_string(),
             ),
             max_turns: Some(max_turns),
             ..Default::default()
@@ -2519,11 +2563,7 @@ mod tests {
     }
 
     fn history_contains_blocked(api: &TestApi) -> bool {
-        api.seen
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()["messages"]
+        api.seen.lock().unwrap().last().unwrap()["messages"]
             .as_array()
             .unwrap()
             .iter()
@@ -2626,11 +2666,15 @@ mod tests {
         test_provider(api.base.clone()).complete(req).await.unwrap();
         assert_eq!(api.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         let seen = api.seen.lock().unwrap();
-        assert!(seen[1]["messages"].as_array().unwrap().iter().any(|message| {
-            message["content"]
-                .as_str()
-                .is_some_and(|content| content.contains("disallowed_tools"))
-        }));
+        assert!(seen[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| {
+                message["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("disallowed_tools"))
+            }));
     }
 
     #[tokio::test]
@@ -2710,10 +2754,7 @@ mod tests {
             .iter()
             .find(|message| message["role"] == "assistant")
             .unwrap();
-        assert_eq!(
-            assistant["reasoning_content"],
-            "Synthetic reasoning field"
-        );
+        assert_eq!(assistant["reasoning_content"], "Synthetic reasoning field");
     }
 
     #[tokio::test]
@@ -2740,10 +2781,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            api.calls.load(std::sync::atomic::Ordering::SeqCst),
-            4
-        );
+        assert_eq!(api.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
         assert!(!history_contains_blocked(&api));
     }
 
@@ -2765,10 +2803,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            api.calls.load(std::sync::atomic::Ordering::SeqCst),
-            3
-        );
+        assert_eq!(api.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert!(history_contains_blocked(&api));
     }
 
@@ -2790,10 +2825,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            api.calls.load(std::sync::atomic::Ordering::SeqCst),
-            4
-        );
+        assert_eq!(api.calls.load(std::sync::atomic::Ordering::SeqCst), 4);
         assert!(!history_contains_blocked(&api));
     }
 
@@ -2808,13 +2840,15 @@ mod tests {
         let extra = serde_json::Map::new();
         let turn = test_provider(api.base.clone())
             .chat_once(
-                "review-model",
-                &messages,
-                None,
-                0.0,
-                Some(100),
-                None,
-                &extra,
+                ChatParams {
+                    model: "review-model",
+                    messages: &messages,
+                    tools: None,
+                    temperature: 0.0,
+                    max_tokens: Some(100),
+                    top_p: None,
+                    extra: &extra,
+                },
                 Duration::from_secs(2),
             )
             .await
@@ -2948,7 +2982,11 @@ Let me write the final code:\n\
         let mut rest = joined.as_str();
         while !rest.is_empty() {
             // Режем по 13 символов, не по байтам — иначе разрежем кириллицу.
-            let take = rest.char_indices().nth(13).map(|(i, _)| i).unwrap_or(rest.len());
+            let take = rest
+                .char_indices()
+                .nth(13)
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
             let (head, tail_str) = rest.split_at(take);
             rest = tail_str;
             if let Some(h) = note_repeats(head, &mut tail, &mut seen, &mut pos) {
@@ -2956,7 +2994,10 @@ Let me write the final code:\n\
                 break;
             }
         }
-        assert!(hit.is_some(), "петля должна ловиться при любой нарезке потока");
+        assert!(
+            hit.is_some(),
+            "петля должна ловиться при любой нарезке потока"
+        );
     }
 
     /// Случай ложного срабатывания 31.08.2026: строка
@@ -3014,7 +3055,8 @@ Let me write the final code:\n\
         let line = "- Remove the JOIN with the group and filter the hierarchy in WHERE.\n";
         // Девять повторов — ещё не срабатывает: законный максимум замерен на 7.
         assert!(feed_with_gaps(line, 9, 6300).is_none());
-        let (caught, n) = feed_with_gaps(line, 10, 6300).expect("десятый повтор должен быть пойман");
+        let (caught, n) =
+            feed_with_gaps(line, 10, 6300).expect("десятый повтор должен быть пойман");
         assert_eq!(n, LOOP_TOTAL_LIMIT);
         assert!(caught.starts_with("- Remove the JOIN"));
     }
@@ -3023,7 +3065,8 @@ Let me write the final code:\n\
     /// частая длинная строка встречалась не более семи раз за ход.
     #[test]
     fn note_repeats_allows_seven_rewrites_per_turn() {
-        let line = "\tЗапрос.УстановитьПараметр(\"Статус\", Перечисления.СтатусыСоглашений.Действует);\n";
+        let line =
+            "\tЗапрос.УстановитьПараметр(\"Статус\", Перечисления.СтатусыСоглашений.Действует);\n";
         assert!(feed_with_gaps(line, 7, 6300).is_none());
     }
 
@@ -3054,10 +3097,12 @@ Let me write the final code:\n\
     /// ложную калибровку, только с другой стороны.
     #[test]
     fn runaway_threshold_sits_above_longest_legal_turn() {
-        assert!(
-            TURN_CHARS_MAX > 100_626,
-            "самый длинный законный ход не должен обрываться"
-        );
+        const {
+            assert!(
+                TURN_CHARS_MAX > 100_626,
+                "самый длинный законный ход не должен обрываться"
+            );
+        }
         assert!(runaway_reason(298_727).contains("298727"));
     }
 
@@ -3065,14 +3110,16 @@ Let me write the final code:\n\
     /// замера 01.09.2026 (6941 знак на 466 ходах) и разносом (99 624).
     #[test]
     fn long_line_threshold_sits_between_legal_and_runaway() {
-        assert!(
-            LOOP_LINE_CHARS_MAX > 6_941,
-            "законная длинная строка не должна обрываться"
-        );
-        assert!(
-            LOOP_LINE_CHARS_MAX < 99_624,
-            "разнос внутри строки обязан обрываться"
-        );
+        const {
+            assert!(
+                LOOP_LINE_CHARS_MAX > 6_941,
+                "законная длинная строка не должна обрываться"
+            );
+            assert!(
+                LOOP_LINE_CHARS_MAX < 99_624,
+                "разнос внутри строки обязан обрываться"
+            );
+        }
     }
 
     /// Тот самый разнос 01.09.2026: строка начинается осмысленно, а дальше идёт
@@ -3194,7 +3241,8 @@ Let me write the final code:\n\
     fn loop_query_joins_tail_and_line() {
         // Дословный затык 31.08.2026: по такой фразе нужный навык встаёт первым,
         // а по одной строке — только смежный.
-        let tail = "There ARE 3082 rows with Статус = \"Действует\" but the WHERE clause returns 0.";
+        let tail =
+            "There ARE 3082 rows with Статус = \"Действует\" but the WHERE clause returns 0.";
         let line = "Actually, let me try passing the enum value as a parameter.";
         let q = loop_query(line, tail);
         assert!(q.contains("WHERE clause returns 0"));
@@ -3222,7 +3270,10 @@ Let me write the final code:\n\
         assert_eq!(first, "external-processing-branches");
         // Оценка возвращается вместе с именем: по ней ветка лечения решает,
         // навык это по теме или случайный сосед по каталогу.
-        assert!(rr > f64::NEG_INFINITY, "оценка реранкера должна разбираться");
+        assert!(
+            rr > f64::NEG_INFINITY,
+            "оценка реранкера должна разбираться"
+        );
         assert!(pick_skill("", &[]).is_none());
     }
 
@@ -3232,10 +3283,18 @@ Let me write the final code:\n\
     /// заметно ниже.
     #[test]
     fn loop_skill_threshold_between_hit_and_neighbour() {
-        assert!(LOOP_SKILL_MIN_RR > -8.0, "серверную отсечку порог не дублирует");
-        assert!(LOOP_SKILL_MIN_RR < -3.9, "медиану верных попаданий не отсекаем");
-        // Сдвиг выборки нужен именно потому, что штатный режим — жадный.
-        assert!(LOOP_NUDGE_TEMP > 0.0);
+        const {
+            assert!(
+                LOOP_SKILL_MIN_RR > -8.0,
+                "серверную отсечку порог не дублирует"
+            );
+            assert!(
+                LOOP_SKILL_MIN_RR < -3.9,
+                "медиану верных попаданий не отсекаем"
+            );
+            // Сдвиг выборки нужен именно потому, что штатный режим — жадный.
+            assert!(LOOP_NUDGE_TEMP > 0.0);
+        }
     }
 
     #[test]

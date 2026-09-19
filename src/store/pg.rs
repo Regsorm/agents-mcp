@@ -22,7 +22,7 @@ use tokio_postgres::Config as PgConfig;
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use super::{
-    validate_task_status_transition, Artifact, CallRow, CallStatus, CachedEntry, HistoryEntry,
+    validate_task_status_transition, Artifact, CachedEntry, CallRow, CallStatus, HistoryEntry,
     LogEvent, NewTask, OrphanedCall, Store, StoreError,
 };
 
@@ -754,7 +754,10 @@ mod tests {
         let cause = message
             .strip_prefix("task-store: нет соединения: ")
             .expect("ошибка классифицирована как отказ соединения");
-        assert!(cause.contains(":"), "исходная цепочка причин потеряна: {message}");
+        assert!(
+            cause.contains(":"),
+            "исходная цепочка причин потеряна: {message}"
+        );
     }
 
     async fn tls_rejecting_server(
@@ -831,8 +834,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "нужен живой PG через AGENTS_MCP_TEST_PG_DSN"]
     async fn pg_round_trip() {
-        let dsn =
-            std::env::var("AGENTS_MCP_TEST_PG_DSN").expect("AGENTS_MCP_TEST_PG_DSN не задан");
+        let dsn = std::env::var("AGENTS_MCP_TEST_PG_DSN").expect("AGENTS_MCP_TEST_PG_DSN не задан");
         let store = PgStore::connect(&dsn, 2).expect("connect");
         store.health().await.expect("health");
 
@@ -874,7 +876,10 @@ mod tests {
             )
             .await
             .expect("write_artifact upsert");
-        assert_eq!(aid, aid2, "upsert по (task_id,key) должен вернуть тот же id");
+        assert_eq!(
+            aid, aid2,
+            "upsert по (task_id,key) должен вернуть тот же id"
+        );
 
         let kinds = vec!["metadata".to_string()];
         let arts = store
@@ -977,7 +982,10 @@ mod tests {
         assert_eq!(child_counts.get::<_, i64>(1), 0);
 
         client
-            .execute("DELETE FROM agents_mcp.tasks WHERE id=ANY($1)", &[&task_ids])
+            .execute(
+                "DELETE FROM agents_mcp.tasks WHERE id=ANY($1)",
+                &[&task_ids],
+            )
             .await
             .expect("очистка тестовых задач");
     }

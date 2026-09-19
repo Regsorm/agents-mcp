@@ -42,18 +42,12 @@ pub struct AgentDefinition {
 /// какие лимиты ставить и можно ли вызывать рекурсивно.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum AgentKind {
     AgentLoop,
+    #[default]
     PromptTemplate,
     Orchestrator,
-}
-
-impl Default for AgentKind {
-    fn default() -> Self {
-        // Большинство агентов — одношаговые prompt-templates. Дефолт безопасен:
-        // клиенты-боты не получат «случайно» сюрпризов с recursion-aware агентом.
-        AgentKind::PromptTemplate
-    }
 }
 
 /// Содержимое per-agent config.toml.
@@ -197,7 +191,7 @@ pub struct InputConfig {
     pub optional: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LimitsConfig {
     #[serde(default)]
     pub max_input_tokens: Option<u32>,
@@ -206,16 +200,6 @@ pub struct LimitsConfig {
     /// `None` означает, что применяется `[agents] default_timeout_sec`.
     #[serde(default)]
     pub timeout_sec: Option<u64>,
-}
-
-impl Default for LimitsConfig {
-    fn default() -> Self {
-        Self {
-            max_input_tokens: None,
-            max_cost_usd: None,
-            timeout_sec: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +276,11 @@ impl Registry {
 
     /// Количество загруженных агентов.
     pub fn len(&self) -> usize {
-        self.inner.read().expect("registry RwLock poisoned").agents.len()
+        self.inner
+            .read()
+            .expect("registry RwLock poisoned")
+            .agents
+            .len()
     }
 
     /// Список всех агентов (отсортирован по имени).
@@ -400,16 +388,13 @@ fn load_all_agents(
         });
     }
     if !agents_dir.is_dir() {
-        return Err(anyhow!(
-            "agents_dir не каталог: {}",
-            agents_dir.display()
-        ));
+        return Err(anyhow!("agents_dir не каталог: {}", agents_dir.display()));
     }
 
     let mut entries = Vec::new();
-    for entry in std::fs::read_dir(agents_dir).with_context(|| {
-        format!("чтение каталога агентов {}", agents_dir.display())
-    })? {
+    for entry in std::fs::read_dir(agents_dir)
+        .with_context(|| format!("чтение каталога агентов {}", agents_dir.display()))?
+    {
         entries.push(entry?.path());
     }
     entries.sort();
@@ -462,8 +447,7 @@ fn load_all_agents(
 fn select_active_agents(
     agents_by_dir: &HashMap<PathBuf, Arc<AgentDefinition>>,
 ) -> HashMap<String, Arc<AgentDefinition>> {
-    let mut candidates: HashMap<String, Vec<(&PathBuf, &Arc<AgentDefinition>)>> =
-        HashMap::new();
+    let mut candidates: HashMap<String, Vec<(&PathBuf, &Arc<AgentDefinition>)>> = HashMap::new();
     for (path, agent) in agents_by_dir {
         candidates
             .entry(agent.name.clone())
@@ -530,8 +514,20 @@ fn unknown_agent_config_keys(raw: &str) -> Result<Vec<String>, toml::de::Error> 
         root,
         "",
         &[
-            "name", "description", "version", "tags", "kind", "model", "response", "input",
-            "limits", "cache", "execution", "claude_cli", "skill_scope", "skill_include_1c",
+            "name",
+            "description",
+            "version",
+            "tags",
+            "kind",
+            "model",
+            "response",
+            "input",
+            "limits",
+            "cache",
+            "execution",
+            "claude_cli",
+            "skill_scope",
+            "skill_include_1c",
             "skill_bodies_top",
         ],
         &mut out,
@@ -539,7 +535,14 @@ fn unknown_agent_config_keys(raw: &str) -> Result<Vec<String>, toml::de::Error> 
     for (section, known) in [
         (
             "model",
-            &["provider", "name", "temperature", "max_tokens", "top_p", "extra_body"][..],
+            &[
+                "provider",
+                "name",
+                "temperature",
+                "max_tokens",
+                "top_p",
+                "extra_body",
+            ][..],
         ),
         ("response", &["format", "schema_file"]),
         ("input", &["required", "optional"]),
@@ -551,15 +554,27 @@ fn unknown_agent_config_keys(raw: &str) -> Result<Vec<String>, toml::de::Error> 
         (
             "execution",
             &[
-                "allowed_tools", "disallowed_tools", "permission_mode", "cwd_template",
-                "allowed_roots", "mcp_config", "max_turns", "extra_args",
+                "allowed_tools",
+                "disallowed_tools",
+                "permission_mode",
+                "cwd_template",
+                "allowed_roots",
+                "mcp_config",
+                "max_turns",
+                "extra_args",
             ],
         ),
         (
             "claude_cli",
             &[
-                "allowed_tools", "disallowed_tools", "permission_mode", "cwd_template",
-                "allowed_roots", "mcp_config", "max_turns", "extra_args",
+                "allowed_tools",
+                "disallowed_tools",
+                "permission_mode",
+                "cwd_template",
+                "allowed_roots",
+                "mcp_config",
+                "max_turns",
+                "extra_args",
             ],
         ),
     ] {
@@ -597,7 +612,10 @@ fn codex_cli_ignored_fields_warning(config: &AgentConfig) -> Option<String> {
         fields.push("permission_mode");
     }
     (!fields.is_empty()).then(|| {
-        format!("codex-cli игнорирует поля [execution]: {}", fields.join(", "))
+        format!(
+            "codex-cli игнорирует поля [execution]: {}",
+            fields.join(", ")
+        )
     })
 }
 
@@ -700,8 +718,8 @@ fn load_schema(dir: &Path, config: &AgentConfig) -> Result<Option<serde_json::Va
     let path = dir.join(file);
     let raw = std::fs::read_to_string(&path)
         .with_context(|| format!("чтение схемы {}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&raw)
-        .with_context(|| format!("парсинг схемы {}", path.display()))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).with_context(|| format!("парсинг схемы {}", path.display()))?;
     Ok(Some(json))
 }
 
@@ -719,8 +737,8 @@ fn load_prompts(dir: &Path) -> Result<HashMap<String, String>> {
             Some(v) => v,
             None => continue,
         };
-        let body = std::fs::read_to_string(&path)
-            .with_context(|| format!("чтение {}", path.display()))?;
+        let body =
+            std::fs::read_to_string(&path).with_context(|| format!("чтение {}", path.display()))?;
         out.insert(variant, body);
     }
     Ok(out)
@@ -884,10 +902,12 @@ permission_mode = "default"
     }
 
     fn write_agent_at(agent_dir: &Path, name: &str, prompt: &str) {
-        std::fs::create_dir_all(&agent_dir).expect("каталог агента");
+        std::fs::create_dir_all(agent_dir).expect("каталог агента");
         std::fs::write(
             agent_dir.join("config.toml"),
-            format!("name = \"{name}\"\n\n[model]\nprovider = \"mock\"\nname = \"mock-model-v0\"\n"),
+            format!(
+                "name = \"{name}\"\n\n[model]\nprovider = \"mock\"\nname = \"mock-model-v0\"\n"
+            ),
         )
         .expect("config.toml агента");
         std::fs::write(agent_dir.join("prompt.md"), prompt).expect("prompt.md агента");
@@ -912,7 +932,8 @@ permission_mode = "default"
     fn allowed_roots_parsed_and_not_reported_unknown() {
         let основа = "name = \"a\"\n[model]\nprovider = \"mock\"\nname = \"m\"\n";
         for имя in ["execution", "claude_cli"] {
-            let текст = format!("{основа}\n[{имя}]\nallowed_roots = [\"C:/work\", \"D:/sandbox\"]\n");
+            let текст =
+                format!("{основа}\n[{имя}]\nallowed_roots = [\"C:/work\", \"D:/sandbox\"]\n");
             let cfg: AgentConfig = toml::from_str(&текст).expect("конфиг разобран");
             let секция = cfg.execution.expect("секция прочитана");
             assert_eq!(
@@ -929,7 +950,10 @@ permission_mode = "default"
         let без_ключа: AgentConfig =
             toml::from_str(&format!("{основа}\n[execution]\nmax_turns = 3\n"))
                 .expect("конфиг разобран");
-        assert_eq!(без_ключа.execution.expect("секция прочитана").allowed_roots, None);
+        assert_eq!(
+            без_ключа.execution.expect("секция прочитана").allowed_roots,
+            None
+        );
         let совсем_без: AgentConfig = toml::from_str(основа).expect("конфиг разобран");
         assert!(совсем_без.execution.is_none());
     }
@@ -980,9 +1004,8 @@ permission_mode = "default"
             if !path.is_dir() || name.starts_with('.') || name.starts_with('_') {
                 continue;
             }
-            load_agent(&path).unwrap_or_else(|error| {
-                panic!("агент {} не загрузился: {error}", path.display())
-            });
+            load_agent(&path)
+                .unwrap_or_else(|error| panic!("агент {} не загрузился: {error}", path.display()));
             loaded += 1;
         }
         assert!(loaded > 0, "каталог agents не должен быть пустым");
@@ -1005,7 +1028,9 @@ permission_mode = "default"
         std::fs::write(&not_a_dir, "x").expect("файл");
         assert!(registry.reload_from(not_a_dir).is_err());
         // Несуществующий каталог (опечатка в пути) — тоже ошибка, а не пустой реестр.
-        assert!(registry.reload_from(base.join("нет-такого-каталога")).is_err());
+        assert!(registry
+            .reload_from(base.join("нет-такого-каталога"))
+            .is_err());
         assert_eq!(registry.len(), 1);
         assert!(registry.get("agent-a").is_some());
 
@@ -1031,7 +1056,9 @@ permission_mode = "default"
 
         std::fs::write(base.join("stable/config.toml"), "это не toml = [")
             .expect("сломанный config.toml");
-        registry.reload().expect("ошибка агента не ломает перечитку");
+        registry
+            .reload()
+            .expect("ошибка агента не ломает перечитку");
 
         let agent = registry.get("stable").expect("прежний агент сохранён");
         assert_eq!(agent.prompts.get("default").unwrap(), "прежний промпт");
@@ -1061,12 +1088,7 @@ permission_mode = "default"
         assert!(duplicate_error.contains(&base.join("b").display().to_string()));
         let registry = Registry::load(base.clone()).expect("реестр загружен");
         assert_eq!(
-            registry
-                .get("a")
-                .unwrap()
-                .prompts
-                .get("default")
-                .unwrap(),
+            registry.get("a").unwrap().prompts.get("default").unwrap(),
             "победитель"
         );
 
@@ -1075,12 +1097,7 @@ permission_mode = "default"
         write_agent_at(&base.join("b"), "a", "обновлённый дубль");
         registry.reload().expect("перечитка");
         assert_eq!(
-            registry
-                .get("a")
-                .unwrap()
-                .prompts
-                .get("default")
-                .unwrap(),
+            registry.get("a").unwrap().prompts.get("default").unwrap(),
             "победитель"
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -1109,7 +1126,9 @@ permission_mode = "default"
 
         let (old_generation, old_dir, previous) = registry.begin_reload();
         let stale = load_all_agents(&old_dir, Some(&previous)).expect("старый результат");
-        registry.reload_from(dir_b).expect("новое поколение применено");
+        registry
+            .reload_from(dir_b)
+            .expect("новое поколение применено");
 
         assert!(registry
             .apply_loaded(old_generation, old_dir, stale)

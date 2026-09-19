@@ -50,7 +50,10 @@ fn parse_var_reference(
     };
     // Вложенная ссылка `${A:-${B}}` не поддерживается: первая `}` закрыла бы
     // внешнюю, и текст `${B` ушёл бы серверу как есть.
-    if default.as_deref().is_some_and(|default| default.contains("${")) {
+    if default
+        .as_deref()
+        .is_some_and(|default| default.contains("${"))
+    {
         return Err("вложенная подстановка в значении по умолчанию не поддерживается".to_string());
     }
     let mut chars = name.chars();
@@ -114,7 +117,14 @@ pub(crate) fn safe_server_address(text: &str) -> String {
 // секреты службы дочернему MCP-серверу не наследуются.
 #[cfg(windows)]
 const STDIO_ENV_ALLOWLIST: &[&str] = &[
-    "SYSTEMROOT", "PATH", "TEMP", "TMP", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "COMSPEC",
+    "SYSTEMROOT",
+    "PATH",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "COMSPEC",
     "PATHEXT",
 ];
 #[cfg(not(windows))]
@@ -337,7 +347,9 @@ pub fn parse_mcp_config(raw: &str) -> Result<Vec<McpServer>, serde_json::Error> 
                             headers
                                 .iter()
                                 .filter_map(|(name, value)| {
-                                    value.as_str().map(|value| (name.clone(), value.to_string()))
+                                    value
+                                        .as_str()
+                                        .map(|value| (name.clone(), value.to_string()))
                                 })
                                 .collect()
                         })
@@ -390,8 +402,8 @@ pub(crate) fn extract_envelope(text: &str, expected_id: i64) -> Result<Value, St
             .unwrap_or_else(|| format!("нет JSON-RPC ответа с id={expected_id}")));
     }
 
-    let mut values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
-    while let Some(value) = values.next() {
+    let values = serde_json::Deserializer::from_str(text).into_iter::<Value>();
+    for value in values {
         let value = value.map_err(|e| format!("parse envelope: {e}"))?;
         if let Some(value) = matching(value, expected_id) {
             return Ok(value);
@@ -449,20 +461,17 @@ async fn perform_handshake(
     for (name, value) in &server.headers {
         builder = builder.header(name, value);
     }
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                format!(
-                    "initialize: сервис {} не ответил за {} с",
-                    safe_server_address(&server.url),
-                    RPC_TIMEOUT.as_secs()
-                )
-            } else {
-                format!("initialize send: {}", safe_server_address(&e.to_string()))
-            }
-        })?;
+    let resp = builder.send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!(
+                "initialize: сервис {} не ответил за {} с",
+                safe_server_address(&server.url),
+                RPC_TIMEOUT.as_secs()
+            )
+        } else {
+            format!("initialize send: {}", safe_server_address(&e.to_string()))
+        }
+    })?;
     let status = resp.status();
     let session = resp
         .headers()
@@ -530,10 +539,7 @@ async fn perform_handshake(
     let note_status = response.status();
     let _ = read_http_body(response, "notifications/initialized").await?;
     if !note_status.is_success() {
-        return Err(format!(
-            "notifications/initialized: HTTP {}",
-            note_status
-        ));
+        return Err(format!("notifications/initialized: HTTP {}", note_status));
     }
     Ok(HttpSessionState {
         id: session,
@@ -596,19 +602,21 @@ async fn rpc_once(
     if let Some(sid) = session {
         builder = builder.header("Mcp-Session-Id", sid);
     }
-    let resp = builder.send().await.map_err(|e| RpcError::Message({
-        if e.is_timeout() {
-            // Отдельная формулировка: молчащий сервис и отказ сервиса лечатся
-            // по-разному, и в журнале это должно различаться с первого взгляда.
-            format!(
-                "{method}: сервис {} не ответил за {} с — считаю его недоступным",
-                safe_server_address(url),
-                RPC_TIMEOUT.as_secs()
-            )
-        } else {
-            format!("{method} send: {}", safe_server_address(&e.to_string()))
-        }
-    }))?;
+    let resp = builder.send().await.map_err(|e| {
+        RpcError::Message({
+            if e.is_timeout() {
+                // Отдельная формулировка: молчащий сервис и отказ сервиса лечатся
+                // по-разному, и в журнале это должно различаться с первого взгляда.
+                format!(
+                    "{method}: сервис {} не ответил за {} с — считаю его недоступным",
+                    safe_server_address(url),
+                    RPC_TIMEOUT.as_secs()
+                )
+            } else {
+                format!("{method} send: {}", safe_server_address(&e.to_string()))
+            }
+        })
+    })?;
     let status = resp.status();
     let text = read_http_body(resp, method)
         .await
@@ -878,8 +886,7 @@ impl StdioServer {
     /// Отправить одно сообщение строкой.
     async fn send(&mut self, msg: &Value) -> Result<(), String> {
         let alias = self.alias.clone();
-        let mut line =
-            serde_json::to_string(msg).map_err(|e| format!("сборка сообщения: {e}"))?;
+        let mut line = serde_json::to_string(msg).map_err(|e| format!("сборка сообщения: {e}"))?;
         line.push('\n');
         let stdin = &mut self.stdin;
         tokio::time::timeout(RPC_TIMEOUT, async move {
@@ -969,12 +976,12 @@ impl StdioServer {
     async fn initialize(&mut self) -> Result<(), String> {
         let result = self
             .rpc(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "agents-mcp", "version": env!("CARGO_PKG_VERSION")}
-            }),
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "agents-mcp", "version": env!("CARGO_PKG_VERSION")}
+                }),
             )
             .await?;
         let protocol_version = result
@@ -1050,11 +1057,10 @@ impl StdioPool {
 
     /// Вызвать инструмент запускаемого процессом сервера.
     pub async fn call(&mut self, full_name: &str, args: Value) -> Result<String, String> {
-        let (alias, tool_name) = self
-            .tools
-            .get(full_name)
-            .cloned()
-            .ok_or_else(|| format!("инструмент {full_name} не из числа запускаемых процессом"))?;
+        let (alias, tool_name) =
+            self.tools.get(full_name).cloned().ok_or_else(|| {
+                format!("инструмент {full_name} не из числа запускаемых процессом")
+            })?;
         let srv = self
             .servers
             .get_mut(&alias)
@@ -1083,10 +1089,7 @@ mod tests {
 
     #[test]
     fn defaults_apply_when_variable_is_missing_or_empty() {
-        assert_eq!(
-            expand_vars("${MISSING:-запас}", |_| None).unwrap(),
-            "запас"
-        );
+        assert_eq!(expand_vars("${MISSING:-запас}", |_| None).unwrap(), "запас");
         assert_eq!(
             expand_vars("${EMPTY:-запас}", |_| Some(String::new())).unwrap(),
             "запас"
@@ -1103,18 +1106,30 @@ mod tests {
 
     #[test]
     fn malformed_reference_is_rejected_and_plain_dollar_is_unchanged() {
-        assert!(expand_vars("${UNCLOSED", |_| None).unwrap_err().contains("незакрытая"));
-        assert!(expand_vars("${1BAD}", |_| None).unwrap_err().contains("недопустимое имя"));
-        assert!(expand_vars("${A:-${B}}", |_| None).unwrap_err().contains("вложенная"));
+        assert!(expand_vars("${UNCLOSED", |_| None)
+            .unwrap_err()
+            .contains("незакрытая"));
+        assert!(expand_vars("${1BAD}", |_| None)
+            .unwrap_err()
+            .contains("недопустимое имя"));
+        assert!(expand_vars("${A:-${B}}", |_| None)
+            .unwrap_err()
+            .contains("вложенная"));
         assert_eq!(expand_vars("цена $5", |_| None).unwrap(), "цена $5");
-        assert_eq!(expand_vars("обычный текст", |_| None).unwrap(), "обычный текст");
+        assert_eq!(
+            expand_vars("обычный текст", |_| None).unwrap(),
+            "обычный текст"
+        );
     }
 
     #[test]
     fn referenced_variables_include_defaults() {
         assert_eq!(
             referenced_vars("${ONE} x ${TWO:-два}"),
-            vec![("ONE".to_string(), None), ("TWO".to_string(), Some("два".to_string()))]
+            vec![
+                ("ONE".to_string(), None),
+                ("TWO".to_string(), Some("два".to_string()))
+            ]
         );
     }
 
@@ -1125,9 +1140,13 @@ mod tests {
         let http = expand_http_server(parse_mcp_config(raw).unwrap().remove(0), lookup).unwrap();
         assert_eq!(http.alias, "${ALIAS}");
         assert_eq!(http.url, "http://value-HOST");
-        assert_eq!(http.headers, vec![("${HEADER}".into(), "Bearer value-TOKEN".into())]);
+        assert_eq!(
+            http.headers,
+            vec![("${HEADER}".into(), "Bearer value-TOKEN".into())]
+        );
 
-        let stdio = expand_stdio_server(parse_stdio_servers(raw).unwrap().remove(0), lookup).unwrap();
+        let stdio =
+            expand_stdio_server(parse_stdio_servers(raw).unwrap().remove(0), lookup).unwrap();
         assert_eq!(stdio.command, "value-CMD");
         assert_eq!(stdio.args, vec!["--token=value-TOKEN"]);
         assert_eq!(stdio.env, vec![("${ENV_KEY}".into(), "value-TOKEN".into())]);
@@ -1135,9 +1154,7 @@ mod tests {
     }
 
     async fn serve_http(app: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/mcp", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
@@ -1178,10 +1195,11 @@ mod tests {
             servers[0].headers,
             vec![("Authorization".into(), "Bearer abc".into())]
         );
-        assert!(parse_mcp_config(r#"{"mcpServers":{"x":{"url":"http://h/mcp"}}}"#)
-            .unwrap()[0]
-            .headers
-            .is_empty());
+        assert!(
+            parse_mcp_config(r#"{"mcpServers":{"x":{"url":"http://h/mcp"}}}"#).unwrap()[0]
+                .headers
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1232,9 +1250,7 @@ mod tests {
     async fn http_headers_reach_entire_mcp_cycle() {
         use tokio::io::AsyncReadExt;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let stub = tokio::spawn(async move {
             let mut seen = Vec::new();
@@ -1325,7 +1341,9 @@ mod tests {
             .expect("HTTP-заглушка не получила все четыре запроса")
             .unwrap();
         assert_eq!(
-            seen.iter().map(|(method, _)| method.as_str()).collect::<Vec<_>>(),
+            seen.iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
             [
                 "initialize",
                 "notifications/initialized",
@@ -1394,7 +1412,10 @@ mod tests {
 
         let session = initialize_session(&client, &server).await.unwrap();
         assert_eq!(session.session_id().await, None);
-        assert!(list_tools(&client, &server, &session).await.unwrap().is_empty());
+        assert!(list_tools(&client, &server, &session)
+            .await
+            .unwrap()
+            .is_empty());
         task.abort();
 
         assert_eq!(
@@ -1465,10 +1486,9 @@ mod tests {
                                 "result": {"protocolVersion": PROTOCOL_VERSION}
                             }))
                             .into_response();
-                            response.headers_mut().insert(
-                                "mcp-session-id",
-                                HeaderValue::from_static(session_id),
-                            );
+                            response
+                                .headers_mut()
+                                .insert("mcp-session-id", HeaderValue::from_static(session_id));
                             response
                         }
                         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
@@ -1567,7 +1587,10 @@ mod tests {
         let tools = list_tools(&client, &server, &session).await.unwrap();
         task.abort();
         assert_eq!(
-            tools.iter().map(|tool| tool.tool_name.as_str()).collect::<Vec<_>>(),
+            tools
+                .iter()
+                .map(|tool| tool.tool_name.as_str())
+                .collect::<Vec<_>>(),
             ["first", "second"]
         );
     }
@@ -1596,10 +1619,9 @@ mod tests {
                             "result": {"protocolVersion": PROTOCOL_VERSION}
                         }))
                         .into_response();
-                        response.headers_mut().insert(
-                            "mcp-session-id",
-                            HeaderValue::from_static("closing"),
-                        );
+                        response
+                            .headers_mut()
+                            .insert("mcp-session-id", HeaderValue::from_static("closing"));
                         response
                     }
                     "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
@@ -1678,7 +1700,10 @@ mod tests {
         }
         let env: HashMap<_, _> = cmd.as_std().get_envs().collect();
         assert!(!env.contains_key(std::ffi::OsStr::new(name)));
-        assert_eq!(env[std::ffi::OsStr::new("A")], Some(std::ffi::OsStr::new("1")));
+        assert_eq!(
+            env[std::ffi::OsStr::new("A")],
+            Some(std::ffi::OsStr::new("1"))
+        );
         assert_eq!(
             env[std::ffi::OsStr::new("PATH")],
             Some(std::ffi::OsStr::new("explicit-path"))
@@ -1735,9 +1760,7 @@ mod tests {
     fn malformed_config_is_distinct_from_empty_server_list() {
         assert!(parse_mcp_config("{broken").is_err());
         assert!(parse_stdio_servers("{broken").is_err());
-        assert!(parse_mcp_config(r#"{"mcpServers":{}}"#)
-            .unwrap()
-            .is_empty());
+        assert!(parse_mcp_config(r#"{"mcpServers":{}}"#).unwrap().is_empty());
         assert!(parse_stdio_servers(r#"{"mcpServers":{}}"#)
             .unwrap()
             .is_empty());
@@ -1824,8 +1847,15 @@ while True:
     #[test]
     fn envelope_from_plain_and_sse() {
         let plain = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
-        assert_eq!(extract_envelope(plain, 1).unwrap()["result"]["ok"], json!(true));
-        let sse = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
-        assert_eq!(extract_envelope(sse, 1).unwrap()["result"]["ok"], json!(true));
+        assert_eq!(
+            extract_envelope(plain, 1).unwrap()["result"]["ok"],
+            json!(true)
+        );
+        let sse =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        assert_eq!(
+            extract_envelope(sse, 1).unwrap()["result"]["ok"],
+            json!(true)
+        );
     }
 }

@@ -115,12 +115,13 @@ pub fn spawn_config(
         }
         // Реагируем только на файл главного конфига (в каталоге могут быть и
         // другие файлы).
-        let hit = event.paths.iter().any(|p| {
-            match (&file_name_filter, p.file_name()) {
+        let hit = event
+            .paths
+            .iter()
+            .any(|p| match (&file_name_filter, p.file_name()) {
                 (Some(want), Some(got)) => want.as_os_str() == got,
                 _ => false,
-            }
-        });
+            });
         if !hit {
             return;
         }

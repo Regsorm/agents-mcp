@@ -25,8 +25,8 @@ use std::time::Duration;
 use crate::config::ModelPrice;
 
 use super::tool_loop::{
-    build_mcp_tools, clamp_tool_result, execute_tool_call, truncate_str, McpTools, ToolCallState,
-    Transcript, DEFAULT_MAX_TOOL_TURNS,
+    build_mcp_tools, clamp_tool_result, execute_tool_call, truncate_str, McpTools, ToolCallInput,
+    ToolCallState, Transcript, DEFAULT_MAX_TOOL_TURNS,
 };
 use super::{pricing, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
@@ -44,6 +44,17 @@ pub struct AnthropicProvider {
     prices: BTreeMap<String, ModelPrice>,
     semaphore: Option<Arc<tokio::sync::Semaphore>>,
     active: Arc<AtomicUsize>,
+}
+
+pub(crate) struct AnthropicOptions {
+    pub name: String,
+    pub api_key: String,
+    pub base_url: Option<String>,
+    pub proxy: Option<String>,
+    pub proxy_bypass: Option<String>,
+    pub max_concurrent: Option<u32>,
+    pub prompt_cache: bool,
+    pub prices: BTreeMap<String, ModelPrice>,
 }
 
 struct ActiveCall(Arc<AtomicUsize>);
@@ -105,16 +116,17 @@ struct MessagesTurn {
 }
 
 impl AnthropicProvider {
-    pub fn new(
-        name: String,
-        api_key: String,
-        base_url: Option<String>,
-        proxy: Option<String>,
-        proxy_bypass: Option<String>,
-        max_concurrent: Option<u32>,
-        prompt_cache: bool,
-        prices: BTreeMap<String, ModelPrice>,
-    ) -> Self {
+    pub fn new(options: AnthropicOptions) -> Self {
+        let AnthropicOptions {
+            name,
+            api_key,
+            base_url,
+            proxy,
+            proxy_bypass,
+            max_concurrent,
+            prompt_cache,
+            prices,
+        } = options;
         let client = super::build_http_client(&name, proxy.as_deref(), proxy_bypass.as_deref());
         Self {
             name,
@@ -308,7 +320,7 @@ impl AnthropicProvider {
                         input,
                     });
                 }
-                Some("redacted_thinking") | _ => {}
+                _ => {}
             }
         }
         if tools.is_empty() && text.is_empty() {
@@ -510,14 +522,16 @@ impl LlmProvider for AnthropicProvider {
                 let tool_started = std::time::Instant::now();
                 let result = execute_tool_call(
                     &self.client,
-                    &self.name,
                     &mut tools,
-                    req.cli_hints.as_ref(),
                     &mut state,
-                    &call.name,
-                    &call.arguments,
-                    parsed,
                     &mut temperature,
+                    ToolCallInput {
+                        provider: &self.name,
+                        hints: req.cli_hints.as_ref(),
+                        tool_name: &call.name,
+                        raw_arguments: &call.arguments,
+                        parsed_arguments: parsed,
+                    },
                 )
                 .await;
                 transcript.write(&json!({
@@ -713,16 +727,16 @@ mod tests {
     }
 
     fn test_provider(base: String, prompt_cache: bool) -> AnthropicProvider {
-        AnthropicProvider::new(
-            "fixture-anthropic".into(),
-            "synthetic-key".into(),
-            Some(base),
-            None,
-            None,
-            None,
+        AnthropicProvider::new(AnthropicOptions {
+            name: "fixture-anthropic".into(),
+            api_key: "synthetic-key".into(),
+            base_url: Some(base),
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: None,
             prompt_cache,
-            BTreeMap::new(),
-        )
+            prices: BTreeMap::new(),
+        })
     }
 
     fn test_provider_with_price(base: String) -> AnthropicProvider {
@@ -736,16 +750,16 @@ mod tests {
                 cache_write: Some(3.0),
             },
         );
-        AnthropicProvider::new(
-            "fixture-anthropic".into(),
-            "synthetic-key".into(),
-            Some(base),
-            None,
-            None,
-            None,
-            false,
+        AnthropicProvider::new(AnthropicOptions {
+            name: "fixture-anthropic".into(),
+            api_key: "synthetic-key".into(),
+            base_url: Some(base),
+            proxy: None,
+            proxy_bypass: None,
+            max_concurrent: None,
+            prompt_cache: false,
             prices,
-        )
+        })
     }
 
     fn test_request() -> LlmRequest {

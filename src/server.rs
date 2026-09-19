@@ -127,7 +127,11 @@ impl AgentsMcpServer {
                 "родословная дочернего вызова взята из ключа"
             );
         }
-        Ok(effective_child_lineage(scope.as_ref(), supplied_parent, supplied_depth))
+        Ok(effective_child_lineage(
+            scope.as_ref(),
+            supplied_parent,
+            supplied_depth,
+        ))
     }
 }
 
@@ -163,7 +167,10 @@ fn effective_child_lineage(
     supplied_depth: u32,
 ) -> (Option<i64>, u32) {
     match call_scope {
-        Some(scope) => (Some(scope.call_id), scope.orchestration_depth.saturating_add(1)),
+        Some(scope) => (
+            Some(scope.call_id),
+            scope.orchestration_depth.saturating_add(1),
+        ),
         None => (supplied_parent, supplied_depth),
     }
 }
@@ -584,8 +591,9 @@ impl AgentsMcpServer {
                 });
                 serde_json::to_string_pretty(&detail).unwrap_or_else(|_| "{}".to_string())
             }
-            None => serde_json::json!({"error": format!("агент '{}' не найден", p.name)})
-                .to_string(),
+            None => {
+                serde_json::json!({"error": format!("агент '{}' не найден", p.name)}).to_string()
+            }
         }
     }
 
@@ -606,14 +614,11 @@ impl AgentsMcpServer {
         extensions: rmcp::model::Extensions,
         Parameters(p): Parameters<InvokeAgentParams>,
     ) -> String {
-        let (parent_call_id, orchestration_depth) = match self.child_lineage(
-            &extensions,
-            p.parent_call_id,
-            p.orchestration_depth,
-        ) {
-            Ok(lineage) => lineage,
-            Err(e) => return err_json(&e),
-        };
+        let (parent_call_id, orchestration_depth) =
+            match self.child_lineage(&extensions, p.parent_call_id, p.orchestration_depth) {
+                Ok(lineage) => lineage,
+                Err(e) => return err_json(&e),
+            };
         // input уже Map<String, Value> благодаря явной типизации в схеме
         // (см. комментарий в InvokeAgentParams). Дополнительной нормализации
         // не требуется — required-поля проверяются в runtime ниже.
@@ -677,9 +682,9 @@ impl AgentsMcpServer {
             Err(e) => return err_json(&e),
         };
         match (p.agent, p.call_id) {
-            (Some(_), Some(_)) => err_json(
-                "передайте либо agent (пуск), либо call_id (проверка) — не оба сразу",
-            ),
+            (Some(_), Some(_)) => {
+                err_json("передайте либо agent (пуск), либо call_id (проверка) — не оба сразу")
+            }
             (None, None) => {
                 err_json("нужен agent (пуск нового вызова) либо call_id (проверка запущенного)")
             }
@@ -709,8 +714,11 @@ impl AgentsMcpServer {
                     // Корни читаем под коротким захватом: guard не живёт через
                     // await ниже (start_background).
                     Some(raw) => {
-                        let roots =
-                            self.fs_roots.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        let roots = self
+                            .fs_roots
+                            .read()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         let service_paths = self
                             .service_paths
                             .read()
@@ -854,7 +862,10 @@ impl AgentsMcpServer {
                        открыть приём: ответ {status:\"accepting\"}. Повторный вызов безопасен, приём \
                        остаётся закрытым до abort или перезапуска службы."
     )]
-    pub async fn prepare_shutdown(&self, Parameters(p): Parameters<PrepareShutdownParams>) -> String {
+    pub async fn prepare_shutdown(
+        &self,
+        Parameters(p): Parameters<PrepareShutdownParams>,
+    ) -> String {
         if p.abort.unwrap_or(false) {
             self.runtime.abort_drain();
             return serde_json::json!({ "status": "accepting", "draining": false }).to_string();
@@ -1052,8 +1063,9 @@ impl AgentsMcpServer {
             }
         }
         match fs_write_apply(&path, &p.content) {
-            Ok(bytes) => serde_json::json!({"ok": true, "path": p.path, "bytes": bytes})
-                .to_string(),
+            Ok(bytes) => {
+                serde_json::json!({"ok": true, "path": p.path, "bytes": bytes}).to_string()
+            }
             Err(e) => err_json(&format!("write: {e}")),
         }
     }
@@ -1088,8 +1100,9 @@ impl AgentsMcpServer {
             Err(e) => return err_json(&e),
         };
         match fs_read_file_content(&path) {
-            Ok(content) => serde_json::json!({"ok": true, "path": p.path, "content": content})
-                .to_string(),
+            Ok(content) => {
+                serde_json::json!({"ok": true, "path": p.path, "content": content}).to_string()
+            }
             Err(e) => err_json(&e),
         }
     }
@@ -1208,16 +1221,14 @@ impl AgentsMcpServer {
             Err(e) => return err_json(&e),
         };
         match fs_edit_apply(&path, &p.old_string, &p.new_string, p.replace_all) {
-            Ok((replaced, bytes, newline_tolerant)) => {
-                serde_json::json!({
-                    "ok": true,
-                    "path": p.path,
-                    "replaced": replaced,
-                    "bytes": bytes,
-                    "newline_tolerant": newline_tolerant
-                })
-                .to_string()
-            }
+            Ok((replaced, bytes, newline_tolerant)) => serde_json::json!({
+                "ok": true,
+                "path": p.path,
+                "replaced": replaced,
+                "bytes": bytes,
+                "newline_tolerant": newline_tolerant
+            })
+            .to_string(),
             Err(e) => err_json(&e),
         }
     }
@@ -1257,9 +1268,7 @@ fn redact_mcp_config_env(config: &mut Value) {
         return;
     };
     redact_env_values(&mut mcp_config);
-    *raw = Value::String(
-        serde_json::to_string(&mcp_config).unwrap_or_else(|_| "***".to_string()),
-    );
+    *raw = Value::String(serde_json::to_string(&mcp_config).unwrap_or_else(|_| "***".to_string()));
 }
 
 fn redact_env_values(value: &mut Value) {
@@ -1289,18 +1298,12 @@ fn redact_env_values(value: &mut Value) {
 /// моделью), путь ДОПОЛНИТЕЛЬНО обязан лежать внутри него: оба условия
 /// обязательны одновременно, проверка общих корней не отменяется.
 /// Возвращает PathBuf для операции либо текст ошибки.
-fn fs_safe_path(
-    roots: &[PathBuf],
-    raw: &str,
-    scope_dir: Option<&str>,
-) -> Result<PathBuf, String> {
+fn fs_safe_path(roots: &[PathBuf], raw: &str, scope_dir: Option<&str>) -> Result<PathBuf, String> {
     let p = Path::new(raw);
     if !p.is_absolute() {
         return Err(format!("путь должен быть абсолютным: {raw}"));
     }
-    if p.components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
+    if p.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(format!("путь содержит '..' (traversal запрещён): {raw}"));
     }
     if has_current_dir_component(raw) {
@@ -1314,7 +1317,9 @@ fn fs_safe_path(
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect();
-    let inside = canonical_roots.iter().any(|root| resolved.starts_with(root));
+    let inside = canonical_roots
+        .iter()
+        .any(|root| resolved.starts_with(root));
     if !inside {
         return Err(format!(
             "путь вне разрешённых корней (config [fs].allowed_roots): {raw}"
@@ -1323,9 +1328,7 @@ fn fs_safe_path(
     if let Some(scope) = scope_dir.filter(|s| !s.is_empty()) {
         let sp = Path::new(scope);
         let bad_scope = !sp.is_absolute()
-            || sp
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
+            || sp.components().any(|c| matches!(c, Component::ParentDir))
             || has_current_dir_component(scope)
             || !scope_has_directory_component(sp);
         if bad_scope {
@@ -1447,7 +1450,9 @@ fn fs_safe_result_path(
 ) -> Result<PathBuf, String> {
     let path = fs_safe_service_path(roots, service_paths, raw, None, true)?;
     if path.is_dir() {
-        return Err(format!("result_path должен быть путём файла, а не каталога: {raw}"));
+        return Err(format!(
+            "result_path должен быть путём файла, а не каталога: {raw}"
+        ));
     }
     let parent = path
         .parent()
@@ -1481,9 +1486,7 @@ fn fs_list_dir_entries(path: &Path, recursive: bool) -> Result<(Vec<Value>, bool
                     break 'directories;
                 }
                 let name = path_for_client(dir.strip_prefix(path).unwrap_or(&dir));
-                entries.push(
-                    serde_json::json!({"name": name, "error": format!("read_dir: {e}")}),
-                );
+                entries.push(serde_json::json!({"name": name, "error": format!("read_dir: {e}")}));
                 continue;
             }
             Err(e) => return Err(format!("read_dir: {e}")),
@@ -1649,8 +1652,8 @@ fn fs_edit_apply(
     if old_string == new_string {
         return Err("old_string и new_string совпадают: замена ничего не изменит".to_string());
     }
-    let meta = std::fs::metadata(path)
-        .map_err(|e| format!("файл не найден: {} ({e})", path.display()))?;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("файл не найден: {} ({e})", path.display()))?;
     if meta.len() > MAX_EDIT_FILE_SIZE {
         return Err(format!(
             "файл слишком большой для точечной правки: {} байт (лимит {MAX_EDIT_FILE_SIZE}): {}",
@@ -1788,9 +1791,10 @@ impl ServerHandler for AgentsMcpServer {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         _context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        let mut result = rmcp::model::ListToolsResult::default();
-        result.tools = self.tool_router.list_all();
-        Ok(result)
+        Ok(rmcp::model::ListToolsResult {
+            tools: self.tool_router.list_all(),
+            ..Default::default()
+        })
     }
 
     async fn call_tool(
@@ -1928,7 +1932,9 @@ mod fs_safe_path_tests {
             registry,
             providers.clone(),
             crate::skills::SkillsClient::new(None),
-            Arc::new(std::sync::RwLock::new(crate::runtime::ModelOverride::default())),
+            Arc::new(std::sync::RwLock::new(
+                crate::runtime::ModelOverride::default(),
+            )),
             tree.0.join("runs"),
             "test:health".into(),
             120,
@@ -1953,17 +1959,18 @@ mod fs_safe_path_tests {
         let down = build_health(chrono::Utc::now(), 0, &runtime).await;
         assert_eq!(down.status, "ok", "верхний статус не меняется");
         assert_eq!(down.providers["mock"].status, "down");
-        assert_eq!(down.providers["mock"].message.as_deref(), Some("doctor failed"));
+        assert_eq!(
+            down.providers["mock"].message.as_deref(),
+            Some("doctor failed")
+        );
     }
 
     struct TempTree(PathBuf);
 
     impl TempTree {
         fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "agents_mcp_fs_{tag}_{}",
-                uuid::Uuid::new_v4()
-            ));
+            let path =
+                std::env::temp_dir().join(format!("agents_mcp_fs_{tag}_{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&path).expect("создать временный каталог");
             Self(path)
         }
@@ -1999,7 +2006,7 @@ mod fs_safe_path_tests {
 
         assert!(
             fs_safe_path(
-                &[tree.0.clone()],
+                std::slice::from_ref(&tree.0),
                 &path_text(&sibling.join("outside.txt")),
                 Some(&path_text(&effective)),
             )
@@ -2008,7 +2015,7 @@ mod fs_safe_path_tests {
         );
         assert!(
             fs_safe_path(
-                &[tree.0.clone()],
+                std::slice::from_ref(&tree.0),
                 &path_text(&scope.join("inside.txt")),
                 Some(&path_text(&effective)),
             )
@@ -2068,7 +2075,7 @@ mod fs_safe_path_tests {
 
         // С ключом и корнями агента путь внутри рабочего каталога разрешён,
         // хотя общий список службы его не покрывает.
-        let roots = effective_fs_roots(Some(&trusted), &[outside.clone()]);
+        let roots = effective_fs_roots(Some(&trusted), std::slice::from_ref(&outside));
         assert!(
             fs_safe_path(&roots, &path_text(&target), Some(&path_text(&effective))).is_ok(),
             "корни агента действуют вместо общего списка"
@@ -2077,7 +2084,7 @@ mod fs_safe_path_tests {
         // Тот же путь без ключа — отказ по общему списку службы.
         assert!(
             fs_safe_path(
-                &effective_fs_roots(None, &[outside.clone()]),
+                &effective_fs_roots(None, std::slice::from_ref(&outside)),
                 &path_text(&target),
                 None
             )
@@ -2095,7 +2102,7 @@ mod fs_safe_path_tests {
         };
         assert!(
             fs_safe_path(
-                &effective_fs_roots(Some(&plain), &[outside.clone()]),
+                &effective_fs_roots(Some(&plain), std::slice::from_ref(&outside)),
                 &path_text(&target),
                 Some(&path_text(&effective))
             )
@@ -2113,7 +2120,7 @@ mod fs_safe_path_tests {
         let paths = protected_path("каталог главного конфига", config_dir.clone(), false);
 
         let err = fs_safe_service_path(
-            &[agent_root.clone()],
+            std::slice::from_ref(&agent_root),
             &paths,
             &path_text(&config_dir.join("agents-mcp.toml")),
             None,
@@ -2156,7 +2163,11 @@ mod fs_safe_path_tests {
         let scope = tree.0.join("proj");
         std::fs::create_dir(&scope).unwrap();
         let path = scope.join("new.txt");
-        let res = fs_safe_path(&[tree.0.clone()], &path_text(&path), Some(&path_text(&scope)));
+        let res = fs_safe_path(
+            std::slice::from_ref(&tree.0),
+            &path_text(&path),
+            Some(&path_text(&scope)),
+        );
         assert!(res.is_ok(), "{res:?}");
     }
 
@@ -2169,7 +2180,7 @@ mod fs_safe_path_tests {
         std::fs::create_dir(&other).unwrap();
         let path = other.join("file.txt");
         let err = fs_safe_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &path_text(&path),
             Some(&path_text(&scope)),
         )
@@ -2183,10 +2194,10 @@ mod fs_safe_path_tests {
         let subdir = tree.0.join("subdir");
         std::fs::create_dir(&subdir).unwrap();
         let path = subdir.join("new.txt");
-        assert!(fs_safe_path(&[tree.0.clone()], &path_text(&path), None).is_ok());
+        assert!(fs_safe_path(std::slice::from_ref(&tree.0), &path_text(&path), None).is_ok());
 
         let traversal = subdir.join("..").join("outside.txt");
-        assert!(fs_safe_path(&[tree.0.clone()], &path_text(&traversal), None).is_err());
+        assert!(fs_safe_path(std::slice::from_ref(&tree.0), &path_text(&traversal), None).is_err());
 
         let current_dir = format!(
             "{}{}.{}new.txt",
@@ -2194,7 +2205,7 @@ mod fs_safe_path_tests {
             std::path::MAIN_SEPARATOR,
             std::path::MAIN_SEPARATOR,
         );
-        assert!(fs_safe_path(&[tree.0.clone()], &current_dir, None).is_err());
+        assert!(fs_safe_path(std::slice::from_ref(&tree.0), &current_dir, None).is_err());
     }
 
     #[test]
@@ -2246,12 +2257,15 @@ mod fs_safe_path_tests {
         std::fs::write(&file, "{}").unwrap();
         let raw = path_text(&file);
 
-        let safe_path = fs_safe_path(&[tree.0.clone()], &raw, None).unwrap();
+        let safe_path = fs_safe_path(std::slice::from_ref(&tree.0), &raw, None).unwrap();
         assert!(!path_text(&safe_path).starts_with(r"\\?\"));
 
-        let result_path =
-            fs_safe_result_path(&[tree.0.clone()], &crate::reload::ServicePaths::default(), &raw)
-                .unwrap();
+        let result_path = fs_safe_result_path(
+            std::slice::from_ref(&tree.0),
+            &crate::reload::ServicePaths::default(),
+            &raw,
+        )
+        .unwrap();
         assert!(!path_text(&result_path).starts_with(r"\\?\"));
     }
 
@@ -2281,7 +2295,7 @@ mod fs_safe_path_tests {
     fn result_path_equal_to_root_rejected() {
         let tree = TempTree::new("result_root");
         let err = fs_safe_result_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &crate::reload::ServicePaths::default(),
             &path_text(&tree.0),
         )
@@ -2294,14 +2308,18 @@ mod fs_safe_path_tests {
         let tree = TempTree::new("result_parent");
         let path = tree.0.join("missing").join("result.json");
         assert!(fs_safe_result_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &crate::reload::ServicePaths::default(),
             &path_text(&path),
         )
         .is_err());
     }
 
-    fn protected_path(name: &'static str, path: PathBuf, write_only: bool) -> crate::reload::ServicePaths {
+    fn protected_path(
+        name: &'static str,
+        path: PathBuf,
+        write_only: bool,
+    ) -> crate::reload::ServicePaths {
         crate::reload::ServicePaths {
             entries: vec![crate::reload::ServicePath {
                 name,
@@ -2320,7 +2338,7 @@ mod fs_safe_path_tests {
 
         for path in [config_dir.join("agents-mcp.toml"), config_dir.join(".env")] {
             let err = fs_safe_service_path(
-                &[tree.0.clone()],
+                std::slice::from_ref(&tree.0),
                 &paths,
                 &path_text(&path),
                 None,
@@ -2342,7 +2360,7 @@ mod fs_safe_path_tests {
 
         let agent_config = agents_dir.join("worker").join("config.toml");
         assert!(fs_safe_service_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &paths,
             &path_text(&agent_config),
             None,
@@ -2350,7 +2368,7 @@ mod fs_safe_path_tests {
         )
         .is_err());
         assert!(fs_safe_service_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &paths,
             &path_text(&neighbor.join("result.txt")),
             None,
@@ -2368,7 +2386,7 @@ mod fs_safe_path_tests {
         let result = runs_dir.join("result.json");
 
         assert!(fs_safe_service_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &paths,
             &path_text(&result),
             None,
@@ -2376,14 +2394,17 @@ mod fs_safe_path_tests {
         )
         .is_ok());
         assert!(fs_safe_service_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &paths,
             &path_text(&result),
             None,
             true,
         )
         .is_err());
-        assert!(fs_safe_result_path(&[tree.0.clone()], &paths, &path_text(&result)).is_err());
+        assert!(
+            fs_safe_result_path(std::slice::from_ref(&tree.0), &paths, &path_text(&result))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2394,11 +2415,10 @@ mod fs_safe_path_tests {
         std::fs::create_dir(&work).unwrap();
         std::fs::create_dir(&config_dir).unwrap();
         let link = work.join("config-link");
-        create_dir_link(&link, &config_dir)
-            .expect("создать ссылку/junction на служебный каталог");
+        create_dir_link(&link, &config_dir).expect("создать ссылку/junction на служебный каталог");
         let paths = protected_path("каталог главного конфига", config_dir, false);
         let err = fs_safe_service_path(
-            &[tree.0.clone()],
+            std::slice::from_ref(&tree.0),
             &paths,
             &path_text(&link.join("agents-mcp.toml")),
             None,
@@ -2436,10 +2456,17 @@ mod fs_safe_path_tests {
         }
         let (entries, truncated) = fs_list_dir_entries(&tree.0, true).unwrap();
         assert!(!truncated);
-        assert!(entries.len() <= 2, "ссылка не должна порождать цикл: {entries:?}");
+        assert!(
+            entries.len() <= 2,
+            "ссылка не должна порождать цикл: {entries:?}"
+        );
         let back = entries
             .iter()
-            .find(|entry| entry["name"].as_str().is_some_and(|name| name.ends_with("back")))
+            .find(|entry| {
+                entry["name"]
+                    .as_str()
+                    .is_some_and(|name| name.ends_with("back"))
+            })
             .expect("ссылка присутствует в выдаче");
         assert_eq!(back["is_symlink"], true);
     }
@@ -2520,7 +2547,10 @@ mod fs_edit_apply_tests {
         let path = write_temp("multi_reject", "aa aa aa");
         let res = fs_edit_apply(&path, "aa", "bb", false);
         let err = res.expect_err("несколько вхождений без replace_all должны быть отклонены");
-        assert!(err.contains('3'), "в тексте ошибки должно быть число вхождений: {err}");
+        assert!(
+            err.contains('3'),
+            "в тексте ошибки должно быть число вхождений: {err}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "aa aa aa",
@@ -2810,9 +2840,11 @@ mod fs_edit_apply_tests {
         // текст ошибки — тот же, что и раньше.
         let path = write_temp("single_line_no_fallback", "hello world");
         let res = fs_edit_apply(&path, "missing", "x", false);
-        let err =
-            res.expect_err("отсутствующий фрагмент без переводов строк должен быть отклонён");
-        assert_eq!(err, format!("фрагмент не найден в файле: {}", path.display()));
+        let err = res.expect_err("отсутствующий фрагмент без переводов строк должен быть отклонён");
+        assert_eq!(
+            err,
+            format!("фрагмент не найден в файле: {}", path.display())
+        );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello world");
         let _ = std::fs::remove_file(&path);
     }

@@ -122,18 +122,31 @@ impl CodexCliProvider {
     /// `codex-cli 0.153.4`). Вызывается из main.rs при старте сервиса для
     /// health-report.
     pub async fn doctor(executable: &PathBuf) -> Result<String, String> {
-        let output = match tokio::time::timeout(Duration::from_secs(15), Command::new(executable)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output())
-            .await
+        let output = match tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(executable)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
         {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(format!("не удалось запустить '{}': {e}", executable.display())),
-            Err(_) => return Err(format!("'{} --version' не завершился за 15 с", executable.display())),
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "не удалось запустить '{}': {e}",
+                    executable.display()
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                    "'{} --version' не завершился за 15 с",
+                    executable.display()
+                ))
+            }
         };
         if !output.status.success() {
             return Err(format!(
@@ -151,10 +164,7 @@ impl CodexCliProvider {
 impl LlmProvider for CodexCliProvider {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
         let deadline = tokio::time::Instant::now() + req.timeout;
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned();
+        let permit = self.semaphore.clone().acquire_owned();
         let permit = tokio::time::timeout_at(deadline, permit)
             .await
             .map_err(|_| LlmError::Timeout)?
@@ -223,7 +233,9 @@ impl LlmProvider for CodexCliProvider {
             .map_err(|e| LlmError::Subprocess(format!("spawn codex: {e}")))?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            match tokio::time::timeout_at(deadline, stdin.write_all(combined_prompt.as_bytes())).await {
+            match tokio::time::timeout_at(deadline, stdin.write_all(combined_prompt.as_bytes()))
+                .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(LlmError::Subprocess(format!("write stdin: {e}"))),
                 Err(_) => return Err(LlmError::Timeout),
@@ -475,18 +487,16 @@ mod tests {
     fn proxy_log_field_hides_password() {
         // Адрес склеен из частей, чтобы проверка секретов перед фиксацией не
         // принимала тестовую строку за настоящий пароль.
-        let proxy = Some(concat!("http://user", ":secret@proxy:3128"));
-        let field = mask_credentials(proxy.unwrap_or("нет"));
+        let proxy = concat!("http://user", ":secret@proxy:3128");
+        let field = mask_credentials(proxy);
         assert!(!field.contains("secret"));
         assert_eq!(field, "***@proxy:3128");
     }
 
     #[tokio::test]
     async fn failed_exit_with_partial_file_returns_error() {
-        let dir = std::env::temp_dir().join(format!(
-            "agents-mcp-codex-fake-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-codex-fake-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("каталог fake codex");
         let source = dir.join("fake_cli.rs");
         std::fs::write(
@@ -545,10 +555,8 @@ mod tests {
 
     #[tokio::test]
     async fn stdin_write_is_inside_provider_timeout() {
-        let dir = std::env::temp_dir().join(format!(
-            "agents-mcp-codex-no-read-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-codex-no-read-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("no_read.rs");
         std::fs::write(
@@ -556,7 +564,11 @@ mod tests {
             "fn main() { std::thread::sleep(std::time::Duration::from_secs(2)); }",
         )
         .unwrap();
-        let executable = dir.join(if cfg!(windows) { "no_read.exe" } else { "no_read" });
+        let executable = dir.join(if cfg!(windows) {
+            "no_read.exe"
+        } else {
+            "no_read"
+        });
         let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
         let compiled = std::process::Command::new(rustc)
             .arg(&source)

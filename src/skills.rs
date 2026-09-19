@@ -35,10 +35,7 @@ impl SkillsClient {
             .timeout(request)
             .build()
             .expect("построение HTTP-клиента навыков");
-        Self {
-            client,
-            url,
-        }
+        Self { client, url }
     }
 
     #[cfg(test)]
@@ -75,10 +72,7 @@ impl SkillsClient {
             .send()
             .await
             .map_err(|e| format!("{tool} send: {e}"))?;
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| format!("{tool} body: {e}"))?;
+        let text = resp.text().await.map_err(|e| format!("{tool} body: {e}"))?;
         let v = extract_envelope(&text, 1).map_err(|e| format!("{tool} {e}"))?;
         v.pointer("/result/content/0/text")
             .and_then(|t| t.as_str())
@@ -257,7 +251,10 @@ pub fn top_scored_by_rerank(catalog: &str, n: usize) -> Vec<(String, f64)> {
     // sort_by с partial_cmp: NEG_INFINITY сравнивается корректно, NaN в оценках
     // не бывает — на нём порядок просто сохранится.
     rows.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    rows.into_iter().take(n).map(|(rr, name)| (name, rr)).collect()
+    rows.into_iter()
+        .take(n)
+        .map(|(rr, name)| (name, rr))
+        .collect()
 }
 
 #[cfg(test)]
@@ -288,8 +285,12 @@ mod tests {
 
     #[test]
     fn top_names_by_rerank_puts_unscored_last() {
-        let text = "• без-оценки\n  описание\n\n• с-оценкой (cos=0.5, rr=-9.0, scope: X)\n  описание";
-        assert_eq!(top_names_by_rerank(text, 2), vec!["с-оценкой", "без-оценки"]);
+        let text =
+            "• без-оценки\n  описание\n\n• с-оценкой (cos=0.5, rr=-9.0, scope: X)\n  описание";
+        assert_eq!(
+            top_names_by_rerank(text, 2),
+            vec!["с-оценкой", "без-оценки"]
+        );
     }
 
     #[test]
@@ -312,7 +313,10 @@ mod tests {
 
     #[test]
     fn format_catalog_name_without_parens() {
-        assert_eq!(format_catalog("• skill-x\n  описание X"), "- skill-x — описание X");
+        assert_eq!(
+            format_catalog("• skill-x\n  описание X"),
+            "- skill-x — описание X"
+        );
     }
 
     #[test]

@@ -291,6 +291,7 @@ pub(crate) fn tool_schema_hint(tools: &[mcp_client::ToolDef], full_name: &str) -
     Some(props.keys().cloned().collect::<Vec<_>>().join(", "))
 }
 
+#[derive(Default)]
 pub(crate) struct McpTools {
     pub(crate) defs: Vec<mcp_client::ToolDef>,
     pub(crate) registry: HashMap<String, (mcp_client::McpServer, String, mcp_client::McpSession)>,
@@ -298,25 +299,17 @@ pub(crate) struct McpTools {
     secret_values: Vec<String>,
 }
 
-impl Default for McpTools {
-    fn default() -> Self {
-        Self {
-            defs: Vec::new(),
-            registry: HashMap::new(),
-            stdio_pool: mcp_client::StdioPool::default(),
-            secret_values: Vec::new(),
-        }
-    }
-}
-
 pub(crate) fn redact_mcp_secrets(text: &str, secret_values: &[String]) -> String {
     // Длинные значения раньше коротких: короткое, совпавшее с началом длинного,
     // иначе оставило бы в тексте хвост длинного секрета.
-    let mut values: Vec<&String> = secret_values.iter().filter(|value| !value.is_empty()).collect();
+    let mut values: Vec<&String> = secret_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .collect();
     values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    values
-        .into_iter()
-        .fold(text.to_string(), |safe, value| safe.replace(value.as_str(), "<секрет>"))
+    values.into_iter().fold(text.to_string(), |safe, value| {
+        safe.replace(value.as_str(), "<секрет>")
+    })
 }
 
 pub(crate) async fn build_mcp_tools(
@@ -325,8 +318,10 @@ pub(crate) async fn build_mcp_tools(
 ) -> Result<McpTools, LlmError> {
     // Серверы, запускаемые процессом: их процессы живут в этом наборе и
     // гаснут вместе с ним, когда вызов агента закончится.
-    let mut result = McpTools::default();
-    result.secret_values = hints.mcp_env.values().cloned().collect();
+    let mut result = McpTools {
+        secret_values: hints.mcp_env.values().cloned().collect(),
+        ..Default::default()
+    };
     let raw = match &hints.mcp_config {
         Some(raw) => raw,
         None => return Ok(result),
@@ -469,17 +464,28 @@ pub(crate) struct ToolCallState {
     empty_counts: HashMap<String, u32>,
 }
 
+pub(crate) struct ToolCallInput<'a> {
+    pub provider: &'a str,
+    pub hints: Option<&'a ClaudeCliHints>,
+    pub tool_name: &'a str,
+    pub raw_arguments: &'a str,
+    pub parsed_arguments: Result<Value, String>,
+}
+
 pub(crate) async fn execute_tool_call(
     client: &Client,
-    provider: &str,
     tools: &mut McpTools,
-    hints: Option<&ClaudeCliHints>,
     state: &mut ToolCallState,
-    tool_name: &str,
-    raw_arguments: &str,
-    parsed_arguments: Result<Value, String>,
     temperature: &mut f32,
+    input: ToolCallInput<'_>,
 ) -> String {
+    let ToolCallInput {
+        provider,
+        hints,
+        tool_name,
+        raw_arguments,
+        parsed_arguments,
+    } = input;
     let forbidden =
         hints.is_some_and(|hints| tool_list_matches(&hints.disallowed_tools, tool_name));
     let (args, args_err) = match parsed_arguments {
@@ -713,7 +719,10 @@ mod tests {
     #[test]
     fn secret_redaction_replaces_longer_values_first() {
         let secrets = vec!["abc".to_string(), "abcdef".to_string()];
-        assert_eq!(redact_mcp_secrets("x=abcdef y=abc", &secrets), "x=<секрет> y=<секрет>");
+        assert_eq!(
+            redact_mcp_secrets("x=abcdef y=abc", &secrets),
+            "x=<секрет> y=<секрет>"
+        );
     }
 
     #[test]

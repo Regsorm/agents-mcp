@@ -11,7 +11,7 @@ use serde::Deserialize;
 
 use crate::errors::{AgentsMcpError, Result};
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -624,20 +624,6 @@ fn resolve_relative_sqlite_dsn(dsn: &mut Option<String>, base_dir: &Path) {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            storage: StorageConfig::default(),
-            agents: AgentsConfig::default(),
-            providers: ProvidersConfig::default(),
-            skills: SkillsConfig::default(),
-            fs: FsConfig::default(),
-            unknown_keys: Vec::new(),
-        }
-    }
-}
-
 fn default_host() -> IpAddr {
     "127.0.0.1".parse().unwrap()
 }
@@ -647,11 +633,7 @@ fn default_port() -> u16 {
 }
 
 fn default_allowed_hosts() -> Vec<String> {
-    vec![
-        "localhost".into(),
-        "127.0.0.1".into(),
-        "::1".into(),
-    ]
+    vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]
 }
 
 #[cfg(windows)]
@@ -817,12 +799,14 @@ cache_hit = 0.006
 
     #[test]
     fn direct_provider_defaults_to_openai_without_prompt_cache() {
-        let cfg: ProvidersConfig = toml::from_str(
-            "[direct.vendor]\napi_key_env = \"VENDOR_KEY\"\n",
-        )
-        .expect("конфиг разбирается");
+        let cfg: ProvidersConfig =
+            toml::from_str("[direct.vendor]\napi_key_env = \"VENDOR_KEY\"\n")
+                .expect("конфиг разбирается");
         let entry = &cfg.direct["vendor"];
-        assert_eq!(entry.api.unwrap_or(ProviderApi::Openai), ProviderApi::Openai);
+        assert_eq!(
+            entry.api.unwrap_or(ProviderApi::Openai),
+            ProviderApi::Openai
+        );
         assert!(!entry.prompt_cache);
     }
 
@@ -837,10 +821,9 @@ cache_hit = 0.006
 
     #[test]
     fn provider_max_concurrent_is_optional() {
-        let cfg: Config = toml::from_str(
-            "[providers.openrouter]\napi_key_env = \"KEY\"\nmax_concurrent = 1\n",
-        )
-        .unwrap();
+        let cfg: Config =
+            toml::from_str("[providers.openrouter]\napi_key_env = \"KEY\"\nmax_concurrent = 1\n")
+                .unwrap();
         assert_eq!(cfg.providers.openrouter.unwrap().max_concurrent, Some(1));
 
         let cfg: Config =
@@ -998,7 +981,10 @@ unexpected = true
         assert!(name.len() > ":8025".len(), "нет имени машины: {name}");
 
         let stdio_name = cfg.instance_name(true);
-        assert!(stdio_name.ends_with(":stdio"), "не stdio в хвосте: {stdio_name}");
+        assert!(
+            stdio_name.ends_with(":stdio"),
+            "не stdio в хвосте: {stdio_name}"
+        );
     }
 
     #[test]

@@ -16,16 +16,16 @@ mod config;
 mod errors;
 mod health;
 mod log_layer;
-mod store;
 mod pid_lock;
 mod proc_tree;
 mod providers;
 mod registry;
 mod reload;
-mod skills;
 mod runtime;
 mod server;
+mod skills;
 mod storage;
+mod store;
 mod watcher;
 
 use crate::store::Store;
@@ -48,7 +48,12 @@ struct Cli {
     ///   stdio — клиент сам запускает этот процесс и говорит с ним через его
     ///           стандартный ввод/вывод; порт не занимается, экземпляр свой
     ///           у каждого клиента.
-    #[arg(short = 't', long = "transport", value_name = "http|stdio", default_value = "http")]
+    #[arg(
+        short = 't',
+        long = "transport",
+        value_name = "http|stdio",
+        default_value = "http"
+    )]
     transport: String,
 }
 
@@ -401,9 +406,7 @@ fn init_tracing(log_layer: log_layer::LogLayer, to_stderr: bool) {
     let env_filter = match EnvFilter::try_new(filter_spec(rust_log.as_deref())) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!(
-                "warning: не удалось разобрать RUST_LOG ({e}), беру фильтр по умолчанию"
-            );
+            eprintln!("warning: не удалось разобрать RUST_LOG ({e}), беру фильтр по умолчанию");
             EnvFilter::new(filter_spec(None))
         }
     };
@@ -428,7 +431,15 @@ fn init_tracing(log_layer: log_layer::LogLayer, to_stderr: bool) {
 }
 
 /// Шумные библиотеки: на info они пишут служебные строки на каждый запрос.
-const QUIET_TARGETS: &[&str] = &["hyper", "h2", "axum", "tower_http", "tower", "rmcp", "tokio_util"];
+const QUIET_TARGETS: &[&str] = &[
+    "hyper",
+    "h2",
+    "axum",
+    "tower_http",
+    "tower",
+    "rmcp",
+    "tokio_util",
+];
 
 /// Выражение фильтра журнала. RUST_LOG задаёт общий уровень, но шумные библиотеки
 /// остаются на warn, если RUST_LOG не называет их явно (например `rmcp=debug`
@@ -456,6 +467,7 @@ fn filter_spec(rust_log: Option<&str>) -> String {
 ///   - Ctrl+Break (некоторые supervisor'ы шлют именно его)
 ///   - Ctrl+Close (closing the console window — это шлёт schtasks /End)
 ///   - Ctrl+Shutdown (выключение Windows)
+///
 /// На Unix — Ctrl+C и SIGTERM.
 async fn shutdown_signal() {
     #[cfg(windows)]
@@ -463,7 +475,9 @@ async fn shutdown_signal() {
         use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
         let c = async {
             match ctrl_c() {
-                Ok(mut signal) => { signal.recv().await; }
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
                 Err(e) => {
                     warn!(error = %e, "не удалось установить обработчик Ctrl+C");
                     std::future::pending::<()>().await;
@@ -472,7 +486,9 @@ async fn shutdown_signal() {
         };
         let b = async {
             match ctrl_break() {
-                Ok(mut signal) => { signal.recv().await; }
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
                 Err(e) => {
                     warn!(error = %e, "не удалось установить обработчик Ctrl+Break");
                     std::future::pending::<()>().await;
@@ -481,7 +497,9 @@ async fn shutdown_signal() {
         };
         let cl = async {
             match ctrl_close() {
-                Ok(mut signal) => { signal.recv().await; }
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
                 Err(e) => {
                     warn!(error = %e, "не удалось установить обработчик Ctrl+Close");
                     std::future::pending::<()>().await;
@@ -490,7 +508,9 @@ async fn shutdown_signal() {
         };
         let sh = async {
             match ctrl_shutdown() {
-                Ok(mut signal) => { signal.recv().await; }
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
                 Err(e) => {
                     warn!(error = %e, "не удалось установить обработчик Ctrl+Shutdown");
                     std::future::pending::<()>().await;
@@ -515,7 +535,9 @@ async fn shutdown_signal() {
         let terminate = async {
             use tokio::signal::unix::{signal, SignalKind};
             match signal(SignalKind::terminate()) {
-                Ok(mut signal) => { signal.recv().await; }
+                Ok(mut signal) => {
+                    signal.recv().await;
+                }
                 Err(e) => {
                     warn!(error = %e, "не удалось установить обработчик SIGTERM");
                     std::future::pending::<()>().await;
@@ -547,7 +569,10 @@ mod tests {
             filter_spec(Some("  ")),
         ] {
             assert_eq!(spec, DEFAULT_SPEC);
-            assert!(EnvFilter::try_new(spec.as_str()).is_ok(), "фильтр не разобран: {spec}");
+            assert!(
+                EnvFilter::try_new(spec.as_str()).is_ok(),
+                "фильтр не разобран: {spec}"
+            );
         }
     }
 
@@ -557,7 +582,10 @@ mod tests {
         assert!(spec.starts_with("debug,rmcp=debug"), "получился {spec}");
         assert!(spec.contains("hyper=warn"), "получился {spec}");
         assert!(!spec.contains("rmcp=warn"), "получился {spec}");
-        assert!(EnvFilter::try_new(spec.as_str()).is_ok(), "фильтр не разобран: {spec}");
+        assert!(
+            EnvFilter::try_new(spec.as_str()).is_ok(),
+            "фильтр не разобран: {spec}"
+        );
     }
 
     #[tokio::test]
@@ -574,7 +602,10 @@ mod tests {
         })
         .await;
 
-        assert!(result.is_err(), "повторный bind занятого порта обязан упасть");
+        assert!(
+            result.is_err(),
+            "повторный bind занятого порта обязан упасть"
+        );
         assert!(
             !called.load(Ordering::SeqCst),
             "стартовая пометка сирот не должна запускаться до успешного bind"

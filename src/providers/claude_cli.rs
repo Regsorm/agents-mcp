@@ -138,18 +138,31 @@ impl ClaudeCliProvider {
     /// Doctor self-test: `claude --version`. Возвращает строку версии либо
     /// ошибку. Вызывается из main.rs при старте сервиса для health-report.
     pub async fn doctor(executable: &PathBuf) -> Result<String, String> {
-        let output = match tokio::time::timeout(Duration::from_secs(15), Command::new(executable)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output())
-            .await
+        let output = match tokio::time::timeout(
+            Duration::from_secs(15),
+            Command::new(executable)
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
         {
             Ok(Ok(o)) => o,
-            Ok(Err(e)) => return Err(format!("не удалось запустить '{}': {e}", executable.display())),
-            Err(_) => return Err(format!("'{} --version' не завершился за 15 с", executable.display())),
+            Ok(Err(e)) => {
+                return Err(format!(
+                    "не удалось запустить '{}': {e}",
+                    executable.display()
+                ))
+            }
+            Err(_) => {
+                return Err(format!(
+                    "'{} --version' не завершился за 15 с",
+                    executable.display()
+                ))
+            }
         };
         if !output.status.success() {
             return Err(format!(
@@ -216,7 +229,8 @@ fn configure_command(
         .arg(max_turns.to_string());
 
     if !hints.allowed_tools.is_empty() {
-        cmd.arg("--allowed-tools").arg(hints.allowed_tools.join(","));
+        cmd.arg("--allowed-tools")
+            .arg(hints.allowed_tools.join(","));
     }
     if !hints.disallowed_tools.is_empty() {
         cmd.arg("--disallowed-tools")
@@ -270,10 +284,7 @@ fn configure_command(
 impl LlmProvider for ClaudeCliProvider {
     async fn complete(&self, req: LlmRequest) -> Result<LlmResponse, LlmError> {
         let deadline = tokio::time::Instant::now() + req.timeout;
-        let permit = self
-            .semaphore
-            .clone()
-            .acquire_owned();
+        let permit = self.semaphore.clone().acquire_owned();
         let permit = tokio::time::timeout_at(deadline, permit)
             .await
             .map_err(|_| LlmError::Timeout)?
@@ -381,10 +392,14 @@ impl LlmProvider for ClaudeCliProvider {
 
         append_prompt_argument(&mut cmd, &combined_prompt, use_stdin);
 
-        cmd.stdin(if use_stdin { Stdio::piped() } else { Stdio::null() })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        cmd.stdin(if use_stdin {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
 
         debug!(
             model = %req.model,
@@ -399,7 +414,9 @@ impl LlmProvider for ClaudeCliProvider {
 
         if use_stdin {
             if let Some(stdin) = child.stdin.as_mut() {
-                match tokio::time::timeout_at(deadline, stdin.write_all(combined_prompt.as_bytes())).await {
+                match tokio::time::timeout_at(deadline, stdin.write_all(combined_prompt.as_bytes()))
+                    .await
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => return Err(LlmError::Subprocess(format!("write stdin: {e}"))),
                     Err(_) => return Err(LlmError::Timeout),

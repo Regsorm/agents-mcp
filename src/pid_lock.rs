@@ -40,6 +40,7 @@ impl PidLock {
         let pid_path = log_dir.join(PID_FILE_NAME);
         let mut file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&pid_path)?;
@@ -48,7 +49,11 @@ impl PidLock {
             let mut content = String::new();
             let _ = file.read_to_string(&mut content);
             let pid = content.trim();
-            let pid = if pid.is_empty() { "неизвестен" } else { pid };
+            let pid = if pid.is_empty() {
+                "неизвестен"
+            } else {
+                pid
+            };
             bail!(
                 "Сервис agents-mcp уже запущен (PID {}). PID-файл: {}. \
                  Если это ошибочное срабатывание — удалите файл или дождитесь его \
@@ -229,10 +234,8 @@ mod tests {
     impl TestDir {
         fn new() -> Self {
             let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "agents-mcp-pid-lock-{}-{id}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("agents-mcp-pid-lock-{}-{id}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             Self(path)
         }

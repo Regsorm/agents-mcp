@@ -21,13 +21,14 @@ use async_trait::async_trait;
 use rusqlite::{Connection, OptionalExtension};
 
 use super::{
-    validate_task_status_transition, Artifact, CallRow, CallStatus, CachedEntry, HistoryEntry,
+    validate_task_status_transition, Artifact, CachedEntry, CallRow, CallStatus, HistoryEntry,
     LogEvent, NewTask, OrphanedCall, Store, StoreError,
 };
 
 /// Схема SQLite — та же, что в migrations_pg, в диалекте SQLite.
 const SCHEMA: &str = include_str!("../../migrations_sqlite/001_init.sql");
-const RESULT_PATH_MIGRATION: &str = include_str!("../../migrations_sqlite/002_agent_calls_result_path.sql");
+const RESULT_PATH_MIGRATION: &str =
+    include_str!("../../migrations_sqlite/002_agent_calls_result_path.sql");
 
 fn visible_error(error: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!("{error:#}")
@@ -53,16 +54,18 @@ impl SqliteStore {
         let memory = path == Path::new(":memory:");
         if !memory {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                std::fs::create_dir_all(parent)
-                    .map_err(|error| anyhow::anyhow!(
-                        "task-store: каталог {} не создан: {error}", parent.display()
-                    ))?;
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    anyhow::anyhow!(
+                        "task-store: каталог {} не создан: {error}",
+                        parent.display()
+                    )
+                })?;
             }
         }
 
-        let conn = Connection::open(path).map_err(|error| anyhow::anyhow!(
-            "task-store: открытие SQLite {}: {error}", path.display()
-        ))?;
+        let conn = Connection::open(path).map_err(|error| {
+            anyhow::anyhow!("task-store: открытие SQLite {}: {error}", path.display())
+        })?;
 
         // WAL — читатели не блокируют писателя; busy_timeout — короткая
         // параллельная запись ждёт, а не падает «database is locked»;
@@ -215,15 +218,16 @@ impl Store for SqliteStore {
                 .context("task-store: SELECT status")?
                 .ok_or(StoreError::TaskNotFound(task_id))?;
             validate_task_status_transition(&current, &status)?;
-            let changed = conn.execute(
-                "UPDATE tasks SET status=?2, \
+            let changed = conn
+                .execute(
+                    "UPDATE tasks SET status=?2, \
                  updated_at = CAST(strftime('%s','now') AS INTEGER), \
                  finished_at = CASE WHEN ?2 IN ('completed','failed') \
                    THEN CAST(strftime('%s','now') AS INTEGER) ELSE NULL END \
                  WHERE id=?1",
-                rusqlite::params![task_id, status],
-            )
-            .context("task-store: UPDATE status")?;
+                    rusqlite::params![task_id, status],
+                )
+                .context("task-store: UPDATE status")?;
             if changed != 1 {
                 return Err(StoreError::TaskNotFound(task_id).into());
             }
@@ -282,7 +286,11 @@ impl Store for SqliteStore {
     }
 
     /// Прочитать артефакты задачи; опционально только указанных `kind`.
-    async fn read_artifacts(&self, task_id: i64, kinds: Option<&[String]>) -> Result<Vec<Artifact>> {
+    async fn read_artifacts(
+        &self,
+        task_id: i64,
+        kinds: Option<&[String]>,
+    ) -> Result<Vec<Artifact>> {
         let kinds_json = match kinds {
             Some(ks) => Some(serde_json::to_string(ks).context("task-store: kinds в JSON")?),
             None => None,
@@ -328,9 +336,9 @@ impl Store for SqliteStore {
         payload_json: Option<&str>,
     ) -> Result<()> {
         if let Some(payload) = payload_json {
-            serde_json::from_str::<serde_json::Value>(payload).map_err(|error| anyhow::anyhow!(
-                "task-store: payload события содержит невалидный JSON: {error}"
-            ))?;
+            serde_json::from_str::<serde_json::Value>(payload).map_err(|error| {
+                anyhow::anyhow!("task-store: payload события содержит невалидный JSON: {error}")
+            })?;
         }
         let event_type = event_type.to_string();
         let agent = agent.map(str::to_string);
@@ -395,14 +403,17 @@ impl Store for SqliteStore {
                 )
                 .context("task-store: подготовка UPDATE осиротевших agent_calls")?;
             let rows = stmt
-                .query_map(rusqlite::params![service_started_at, reason, instance], |r| {
-                    Ok(OrphanedCall {
-                        id: r.get(0)?,
-                        agent_name: r.get(1)?,
-                        created_at: r.get(2)?,
-                        result_path: r.get(3)?,
-                    })
-                })
+                .query_map(
+                    rusqlite::params![service_started_at, reason, instance],
+                    |r| {
+                        Ok(OrphanedCall {
+                            id: r.get(0)?,
+                            agent_name: r.get(1)?,
+                            created_at: r.get(2)?,
+                            result_path: r.get(3)?,
+                        })
+                    },
+                )
                 .and_then(|m| m.collect::<rusqlite::Result<Vec<OrphanedCall>>>())
                 .context("task-store: UPDATE осиротевших agent_calls")?;
             Ok(rows)
@@ -855,12 +866,23 @@ mod tests {
         let store = mem_store().await;
         let call_id = store
             .insert_call_stub(
-                "mock-agent", "default", "hash-1", "mock", "mock", None, None, "test:1",
+                "mock-agent",
+                "default",
+                "hash-1",
+                "mock",
+                "mock",
+                None,
+                None,
+                "test:1",
             )
             .await
             .expect("insert_call_stub");
 
-        let row = store.get_call_row(call_id).await.unwrap().expect("строка есть");
+        let row = store
+            .get_call_row(call_id)
+            .await
+            .unwrap()
+            .expect("строка есть");
         assert_eq!(row.status, "running");
         assert_eq!(row.agent_name, "mock-agent");
         assert_eq!(row.variant, "default");
@@ -894,7 +916,11 @@ mod tests {
             .await
             .expect("update_call");
 
-        let row = store.get_call_row(call_id).await.unwrap().expect("строка есть");
+        let row = store
+            .get_call_row(call_id)
+            .await
+            .unwrap()
+            .expect("строка есть");
         assert_eq!(row.status, "done");
         assert_eq!(row.output_json.as_deref(), Some("{\"ok\":true}"));
         assert_eq!(row.tokens_in, Some(11));
@@ -922,7 +948,11 @@ mod tests {
             .is_empty());
 
         assert!(store.get_call_created_at(call_id).await.unwrap().is_some());
-        assert!(store.get_call_created_at(call_id + 1000).await.unwrap().is_none());
+        assert!(store
+            .get_call_created_at(call_id + 1000)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -930,7 +960,14 @@ mod tests {
         let store = mem_store().await;
         let call_id = store
             .insert_call_stub(
-                "mock-agent", "default", "hash-2", "mock", "mock", None, None, "test:1",
+                "mock-agent",
+                "default",
+                "hash-2",
+                "mock",
+                "mock",
+                None,
+                None,
+                "test:1",
             )
             .await
             .unwrap();
@@ -952,7 +989,11 @@ mod tests {
             )
             .await
             .expect("update_call с ошибкой");
-        let row = store.get_call_row(call_id).await.unwrap().expect("строка есть");
+        let row = store
+            .get_call_row(call_id)
+            .await
+            .unwrap()
+            .expect("строка есть");
         assert_eq!(row.status, "error");
         assert_eq!(row.error.as_deref(), Some("провайдер отказал"));
         assert_eq!(row.output_json, None);
@@ -964,7 +1005,14 @@ mod tests {
         let store = mem_store().await;
         let call_id = store
             .insert_call_stub(
-                "mock-agent", "default", "hash-3", "mock", "mock", None, None, "test:1",
+                "mock-agent",
+                "default",
+                "hash-3",
+                "mock",
+                "mock",
+                None,
+                None,
+                "test:1",
             )
             .await
             .unwrap();
@@ -991,7 +1039,11 @@ mod tests {
             .cache_store("key-1", "{\"a\":1}", "{\"model\":\"mock\"}", 60)
             .await
             .expect("cache_store");
-        let hit = store.cache_lookup("key-1").await.unwrap().expect("живая запись");
+        let hit = store
+            .cache_lookup("key-1")
+            .await
+            .unwrap()
+            .expect("живая запись");
         assert_eq!(hit.output_json, "{\"a\":1}");
         assert_eq!(hit.metadata_json, "{\"model\":\"mock\"}");
 
@@ -1000,7 +1052,11 @@ mod tests {
             .cache_store("key-1", "{\"a\":2}", "{\"model\":\"mock-2\"}", 60)
             .await
             .expect("cache_store повторно");
-        let hit = store.cache_lookup("key-1").await.unwrap().expect("живая запись");
+        let hit = store
+            .cache_lookup("key-1")
+            .await
+            .unwrap()
+            .expect("живая запись");
         assert_eq!(hit.output_json, "{\"a\":2}");
         assert_eq!(hit.metadata_json, "{\"model\":\"mock-2\"}");
 
@@ -1051,7 +1107,9 @@ mod tests {
             .set_task_status(task_id, "needs_input")
             .await
             .expect_err("из completed нельзя сразу перейти в needs_input");
-        assert!(transition_error.to_string().contains("недопустимый переход"));
+        assert!(transition_error
+            .to_string()
+            .contains("недопустимый переход"));
 
         store
             .set_task_status(task_id, "running")
@@ -1134,7 +1192,13 @@ mod tests {
             .is_empty());
 
         store
-            .append_task_event(task_id, "agent_start", Some("mock-agent"), Some(first), None)
+            .append_task_event(
+                task_id,
+                "agent_start",
+                Some("mock-agent"),
+                Some(first),
+                None,
+            )
             .await
             .expect("append_task_event");
         store
@@ -1156,12 +1220,18 @@ mod tests {
     #[tokio::test]
     async fn task_event_rejects_invalid_json_payload() {
         let store = mem_store().await;
-        let task_id = store.create_task(&NewTask::default()).await.expect("create_task");
+        let task_id = store
+            .create_task(&NewTask::default())
+            .await
+            .expect("create_task");
         let error = store
             .append_task_event(task_id, "broken", None, None, Some("{oops"))
             .await
             .expect_err("невалидный JSON должен быть отвергнут");
-        assert!(error.to_string().contains("невалидный JSON"), "error={error}");
+        assert!(
+            error.to_string().contains("невалидный JSON"),
+            "error={error}"
+        );
 
         let events = store
             .run(move |conn| {
@@ -1184,7 +1254,14 @@ mod tests {
         let stale_finished = store.create_task(&NewTask::default()).await.unwrap();
         store
             .write_artifact(
-                stale_finished, "query", "stale", Some("SELECT 1"), None, None, None, &[],
+                stale_finished,
+                "query",
+                "stale",
+                Some("SELECT 1"),
+                None,
+                None,
+                None,
+                &[],
             )
             .await
             .expect("старый артефакт");
@@ -1192,24 +1269,40 @@ mod tests {
             .append_task_event(stale_finished, "done", None, None, Some("{}"))
             .await
             .expect("старое событие");
-        store.set_task_status(stale_finished, "completed").await.unwrap();
+        store
+            .set_task_status(stale_finished, "completed")
+            .await
+            .unwrap();
 
         let stale_running = store.create_task(&NewTask::default()).await.unwrap();
         let fresh_artifact_task = store.create_task(&NewTask::default()).await.unwrap();
         store
             .write_artifact(
-                fresh_artifact_task, "query", "fresh", Some("SELECT 2"), None, None, None, &[],
+                fresh_artifact_task,
+                "query",
+                "fresh",
+                Some("SELECT 2"),
+                None,
+                None,
+                None,
+                &[],
             )
             .await
             .expect("свежий артефакт");
-        store.set_task_status(fresh_artifact_task, "failed").await.unwrap();
+        store
+            .set_task_status(fresh_artifact_task, "failed")
+            .await
+            .unwrap();
 
         let fresh_event_task = store.create_task(&NewTask::default()).await.unwrap();
         store
             .append_task_event(fresh_event_task, "fresh", None, None, Some("{}"))
             .await
             .expect("свежее событие");
-        store.set_task_status(fresh_event_task, "completed").await.unwrap();
+        store
+            .set_task_status(fresh_event_task, "completed")
+            .await
+            .unwrap();
 
         let fresh_ts = chrono::Utc::now().timestamp();
         store
@@ -1217,7 +1310,10 @@ mod tests {
                 conn.execute(
                     "UPDATE tasks SET updated_at=0 WHERE id IN (?1, ?2, ?3, ?4)",
                     rusqlite::params![
-                        stale_finished, stale_running, fresh_artifact_task, fresh_event_task
+                        stale_finished,
+                        stale_running,
+                        fresh_artifact_task,
+                        fresh_event_task
                     ],
                 )
                 .context("состаривание задач")?;
@@ -1317,7 +1413,14 @@ mod tests {
         let store = mem_store().await;
         let old_id = store
             .insert_call_stub(
-                "mock-agent", "default", "hash-old", "mock", "mock", None, None, "test:1",
+                "mock-agent",
+                "default",
+                "hash-old",
+                "mock",
+                "mock",
+                None,
+                None,
+                "test:1",
             )
             .await
             .unwrap();
@@ -1328,7 +1431,14 @@ mod tests {
             .expect("сохранение result_path осиротевшего вызова");
         let fresh_id = store
             .insert_call_stub(
-                "mock-agent", "default", "hash-new", "mock", "mock", None, None, "test:1",
+                "mock-agent",
+                "default",
+                "hash-new",
+                "mock",
+                "mock",
+                None,
+                None,
+                "test:1",
             )
             .await
             .unwrap();
@@ -1362,9 +1472,17 @@ mod tests {
             Some("C:/Temp/orphaned-result.json")
         );
 
-        let old_row = store.get_call_row(old_id).await.unwrap().expect("строка есть");
+        let old_row = store
+            .get_call_row(old_id)
+            .await
+            .unwrap()
+            .expect("строка есть");
         assert_eq!(old_row.status, "error");
-        let fresh_row = store.get_call_row(fresh_id).await.unwrap().expect("строка есть");
+        let fresh_row = store
+            .get_call_row(fresh_id)
+            .await
+            .unwrap()
+            .expect("строка есть");
         assert_eq!(fresh_row.status, "running", "свежий вызов не помечается");
 
         // Повторный вызов ничего не находит: осиротевших больше нет.
@@ -1379,15 +1497,21 @@ mod tests {
     async fn orphan_marking_touches_only_own_instance() {
         let store = mem_store().await;
         let own_id = store
-            .insert_call_stub("a-agent", "default", "h-a", "mock", "mock", None, None, "a:1")
+            .insert_call_stub(
+                "a-agent", "default", "h-a", "mock", "mock", None, None, "a:1",
+            )
             .await
             .unwrap();
         let other_id = store
-            .insert_call_stub("b-agent", "default", "h-b", "mock", "mock", None, None, "b:1")
+            .insert_call_stub(
+                "b-agent", "default", "h-b", "mock", "mock", None, None, "b:1",
+            )
             .await
             .unwrap();
         let legacy_id = store
-            .insert_call_stub("c-agent", "default", "h-c", "mock", "mock", None, None, "c:1")
+            .insert_call_stub(
+                "c-agent", "default", "h-c", "mock", "mock", None, None, "c:1",
+            )
             .await
             .unwrap();
         // Строка без экземпляра — так её оставила старая сборка.
@@ -1405,11 +1529,8 @@ mod tests {
         // Все три строки начаты раньше запуска службы.
         store
             .run(move |conn| {
-                conn.execute(
-                    "UPDATE agent_calls SET created_at = created_at - 3600",
-                    [],
-                )
-                .context("task-store: сдвиг created_at")?;
+                conn.execute("UPDATE agent_calls SET created_at = created_at - 3600", [])
+                    .context("task-store: сдвиг created_at")?;
                 Ok(())
             })
             .await
@@ -1423,7 +1544,11 @@ mod tests {
         assert_eq!(marked.len(), 1, "помечается только свой экземпляр");
         assert_eq!(marked[0].id, own_id);
 
-        let own = store.get_call_row(own_id).await.unwrap().expect("строка есть");
+        let own = store
+            .get_call_row(own_id)
+            .await
+            .unwrap()
+            .expect("строка есть");
         assert_eq!(own.status, "error");
         let other = store
             .get_call_row(other_id)
@@ -1488,7 +1613,9 @@ mod tests {
 
         let store = SqliteStore::open(&path).expect("open старой базы");
         let call_id = store
-            .insert_call_stub("x-agent", "default", "h-x", "mock", "mock", None, None, "x:1")
+            .insert_call_stub(
+                "x-agent", "default", "h-x", "mock", "mock", None, None, "x:1",
+            )
             .await
             .expect("insert_call_stub в обновлённую базу");
         let history = store.list_calls(Some("x-agent"), 0, 10).await.unwrap();

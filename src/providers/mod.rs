@@ -348,7 +348,10 @@ mod tests {
         // Сама библиотека такой адрес принимает молча — проверка наша.
         let res = parse_proxy_setting(Some("socks5://127.0.0.1:9"), None);
         let err = res.expect_err("socks-адрес должен быть отклонён");
-        assert!(err.contains("socks5"), "в тексте ошибки нужен сам адрес: {err}");
+        assert!(
+            err.contains("socks5"),
+            "в тексте ошибки нужен сам адрес: {err}"
+        );
     }
 
     #[test]

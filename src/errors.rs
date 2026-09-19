@@ -26,7 +26,9 @@ pub fn safe_config_error(error: &AgentsMcpError) -> String {
                 .and_then(|s| s.split(',').next())
                 .and_then(|s| s.parse::<usize>().ok());
             match line {
-                Some(line) => format!("ошибка разбора конфига в строке {line} (текст строки скрыт)"),
+                Some(line) => {
+                    format!("ошибка разбора конфига в строке {line} (текст строки скрыт)")
+                }
                 None => match error.span() {
                     Some(span) => format!(
                         "ошибка разбора конфига, байтовая позиция {} (текст строки скрыт)",

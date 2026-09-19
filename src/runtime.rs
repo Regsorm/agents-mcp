@@ -27,8 +27,8 @@ use crate::cache;
 use crate::health::ProviderStatus;
 use crate::providers::mcp_client;
 use crate::providers::{ClaudeCliHints, LlmError, LlmProvider, LlmRequest};
-use crate::reload::ProviderEnv;
 use crate::registry::{AgentDefinition, ExecutionConfig, Registry, ResponseFormat};
+use crate::reload::ProviderEnv;
 use crate::store::{CallStatus, OrphanedCall, Store};
 
 pub(crate) const CALL_KEY_HEADER: &str = "x-agents-mcp-call";
@@ -214,7 +214,7 @@ pub enum InvokeError {
     McpConfig(String),
 
     #[error("ошибка провайдера: {0}")]
-    Llm(#[from] LlmError),
+    Llm(#[source] Box<LlmError>),
 
     #[error("превышен общий срок прогона ({timeout_sec} с)")]
     RunTimeout { timeout_sec: u64 },
@@ -246,6 +246,12 @@ pub enum InvokeError {
 
     #[error("служба готовится к остановке: новые вызовы не принимаются")]
     ShuttingDown,
+}
+
+impl From<LlmError> for InvokeError {
+    fn from(error: LlmError) -> Self {
+        Self::Llm(Box::new(error))
+    }
 }
 
 /// Запись реестра живых фоновых вызовов: чем остановить задачу и что нужно,
@@ -415,13 +421,8 @@ impl CallRegistry {
     /// тогда запись появляется раньше, чем задача успеет снять себя. Иначе
     /// мгновенно завершившийся вызов оставил бы в реестре фантом — вызов,
     /// которого уже нет, но который числится отменяемым.
-    fn spawn_registered<F>(
-        &self,
-        call_id: i64,
-        agent: String,
-        result_path: Option<PathBuf>,
-        job: F,
-    ) where
+    fn spawn_registered<F>(&self, call_id: i64, agent: String, result_path: Option<PathBuf>, job: F)
+    where
         F: FnOnce() -> tokio::task::JoinHandle<()>,
     {
         let mut map = self.lock();
@@ -546,10 +547,7 @@ pub struct DrainStatus {
 impl DrainStatus {
     /// Службу можно останавливать: приём закрыт, идущих вызовов нет.
     pub fn ready(&self) -> bool {
-        self.draining
-            && self.preparing == 0
-            && self.finalizing == 0
-            && self.live.is_empty()
+        self.draining && self.preparing == 0 && self.finalizing == 0 && self.live.is_empty()
     }
 }
 
@@ -616,7 +614,11 @@ fn format_task_context(artifacts: &[crate::store::Artifact]) -> String {
                 head.push_str(s);
             }
             if head.chars().count() > MAX_HEAD {
-                head = head.chars().take(MAX_HEAD - 1).chain(std::iter::once('…')).collect();
+                head = head
+                    .chars()
+                    .take(MAX_HEAD - 1)
+                    .chain(std::iter::once('…'))
+                    .collect();
             }
             head.push('\n');
             head
@@ -737,9 +739,18 @@ impl Runtime {
             .unwrap_or_else(|e| e.into_inner())
             .insert(
                 key.clone(),
-                CallScope { call_id, cwd, allowed_roots, parent_call_id, orchestration_depth },
+                CallScope {
+                    call_id,
+                    cwd,
+                    allowed_roots,
+                    parent_call_id,
+                    orchestration_depth,
+                },
             );
-        let guard = CallKeyGuard { key: key.clone(), scopes: Arc::clone(&self.call_scopes) };
+        let guard = CallKeyGuard {
+            key: key.clone(),
+            scopes: Arc::clone(&self.call_scopes),
+        };
         (key, guard)
     }
 
@@ -766,7 +777,10 @@ impl Runtime {
             .map(|name| (name.clone(), ProviderStatus::registered()))
             .collect();
         *self.providers.write().unwrap_or_else(|e| e.into_inner()) = providers;
-        *self.provider_statuses.write().unwrap_or_else(|e| e.into_inner()) = statuses;
+        *self
+            .provider_statuses
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = statuses;
     }
 
     /// Подменить провайдеры вместе с результатами их стартовой проверки.
@@ -776,7 +790,10 @@ impl Runtime {
         statuses: HashMap<String, ProviderStatus>,
     ) {
         *self.providers.write().unwrap_or_else(|e| e.into_inner()) = providers;
-        *self.provider_statuses.write().unwrap_or_else(|e| e.into_inner()) = statuses;
+        *self
+            .provider_statuses
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = statuses;
     }
 
     /// Подменить клиент навыков — перечитка `[skills] rag_query_url`.
@@ -812,7 +829,10 @@ impl Runtime {
 
     /// Клон клиента навыков под коротким захватом: guard не живёт через await.
     fn skills(&self) -> crate::skills::SkillsClient {
-        self.skills.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.skills
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Полное тело навыка по имени (для MCP-tool skill_load).
@@ -935,14 +955,8 @@ impl Runtime {
             Err(_) => {
                 let call_id = preparing_call_id.load(Ordering::SeqCst);
                 if call_id > 0 {
-                    finish_timed_out_call(
-                        self.pg.clone(),
-                        call_id,
-                        &req.agent,
-                        start,
-                        timeout_sec,
-                    )
-                    .await;
+                    finish_timed_out_call(self.pg.clone(), call_id, &req.agent, start, timeout_sec)
+                        .await;
                 }
                 return Err(InvokeError::RunTimeout { timeout_sec });
             }
@@ -955,8 +969,9 @@ impl Runtime {
                 Prepared::Ready(ready) => {
                     // Синхронный вызов виден реестру: пока он идёт,
                     // prepare_shutdown его дожидается.
-                    let _sync_guard =
-                        self.calls.register_sync(ready.call_id, ready.agent_name.clone());
+                    let _sync_guard = self
+                        .calls
+                        .register_sync(ready.call_id, ready.agent_name.clone());
                     drop(admission);
                     match execute_ready_guarded(self.pg.clone(), *ready).await {
                         Ok(CompletedCall::Done(resp)) => Ok(InvokeOutcome::Sync(resp)),
@@ -1057,14 +1072,8 @@ impl Runtime {
             Err(_) => {
                 let call_id = preparing_call_id.load(Ordering::SeqCst);
                 if call_id > 0 {
-                    finish_timed_out_call(
-                        self.pg.clone(),
-                        call_id,
-                        &req.agent,
-                        start,
-                        timeout_sec,
-                    )
-                    .await;
+                    finish_timed_out_call(self.pg.clone(), call_id, &req.agent, start, timeout_sec)
+                        .await;
                 }
                 return Err(InvokeError::RunTimeout { timeout_sec });
             }
@@ -1408,10 +1417,9 @@ impl Runtime {
                     warn!(call_id, error = %e, "остановка: не удалось закрыть строку вызова");
                 }
                 if let Some(path) = entry.result_path.as_ref() {
-                    if let Err(e) = write_result_file(
-                        path,
-                        &envelope_error(call_id, &entry.agent, &reason),
-                    ) {
+                    if let Err(e) =
+                        write_result_file(path, &envelope_error(call_id, &entry.agent, &reason))
+                    {
                         warn!(call_id, path = %path.display(), error = %e,
                               "остановка: не записал файл-итог вызова");
                     }
@@ -1436,8 +1444,11 @@ impl Runtime {
             Ok(stopped) => stopped,
             Err(_) => {
                 tasks.abort_all();
-                warn!(total, timeout_ms = timeout.as_millis(),
-                      "истёк срок финализации фоновых вызовов при остановке");
+                warn!(
+                    total,
+                    timeout_ms = timeout.as_millis(),
+                    "истёк срок финализации фоновых вызовов при остановке"
+                );
                 0
             }
         }
@@ -1546,7 +1557,10 @@ impl Runtime {
         let (provider_name, model_name) = {
             // Короткий захват RwLock: читаем override, клонируем строки, отпускаем
             // ДО любого await ниже (guard не живёт через await-точки).
-            let ov = self.force_override.read().unwrap_or_else(|e| e.into_inner());
+            let ov = self
+                .force_override
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
             match (&ov.provider, &ov.model) {
                 (Some(fp), Some(fm)) => (fp.clone(), fm.clone()),
                 _ => (
@@ -1560,10 +1574,7 @@ impl Runtime {
         // состояния: изменения за границей среза тоже инвалидируют ответ.
         let (task_context, task_context_fingerprint) = match req.task_id {
             Some(tid) => match self.pg.read_artifacts(tid, None).await {
-                Ok(arts) => (
-                    format_task_context(&arts),
-                    task_context_fingerprint(&arts),
-                ),
+                Ok(arts) => (format_task_context(&arts), task_context_fingerprint(&arts)),
                 Err(e) => {
                     warn!(task_id = tid, error = %e, "task-store: чтение артефактов упало, срез пуст");
                     (String::new(), String::new())
@@ -1578,17 +1589,17 @@ impl Runtime {
         // Один и тот же ключ идёт и в lookup, и в последующий store. В него
         // входят фактические provider/model, исходный prompt.md и отпечаток доски.
         let cache_key = agent.config.cache.enabled.then(|| {
-            cache::compute_key(
-                &req.agent,
-                &variant,
-                &provider_name,
-                &model_name,
-                prompt_tmpl,
-                &task_context_fingerprint,
-                &req.input,
-                &agent.config.cache.key_fields,
-                req.task_id,
-            )
+            cache::compute_key(cache::CacheKeyParts {
+                agent_name: &req.agent,
+                variant: &variant,
+                provider_name: &provider_name,
+                model_name: &model_name,
+                prompt: prompt_tmpl,
+                task_context: &task_context_fingerprint,
+                input: &req.input,
+                key_fields: &agent.config.cache.key_fields,
+                task_id: req.task_id,
+            })
         });
         if let Some(key) = cache_key.as_ref() {
             match cache::lookup(self.pg.as_ref(), key.clone()).await {
@@ -1689,7 +1700,10 @@ impl Runtime {
         // и готовое значение для прокидывания в дочерний invoke_agent.
         // Имена с префиксом `_` чтобы не конфликтовать с доменными полями input.
         ctx.insert("_orchestration_depth", &req.orchestration_depth);
-        ctx.insert("_orchestration_depth_plus_one", &(req.orchestration_depth + 1));
+        ctx.insert(
+            "_orchestration_depth_plus_one",
+            &(req.orchestration_depth + 1),
+        );
 
         // Pre-insert pattern (shared-session):
         // Резервируем call_id ДО provider.complete(), чтобы оркестратор мог
@@ -1708,8 +1722,8 @@ impl Runtime {
                 req.task_id,
                 &self.instance,
             )
-        .await
-        .map_err(|e| InvokeError::Db(format!("{e}")))?;
+            .await
+            .map_err(|e| InvokeError::Db(format!("{e}")))?;
         preparing_call_id.store(call_id, Ordering::SeqCst);
         ctx.insert("_my_call_id", &call_id);
         // Номер зарезервирован — пара к этой записи будет в конце вызова
@@ -1748,7 +1762,12 @@ impl Runtime {
                     String::new()
                 }
                 Err(_) => {
-                    record_skills_unavailable(&skills, &turn_sink, waited.elapsed(), "срок прогона");
+                    record_skills_unavailable(
+                        &skills,
+                        &turn_sink,
+                        waited.elapsed(),
+                        "срок прогона",
+                    );
                     String::new()
                 }
             }
@@ -1794,7 +1813,12 @@ impl Runtime {
                         record_skills_unavailable(&skills, &turn_sink, waited.elapsed(), &reason);
                     }
                     Err(_) => {
-                        record_skills_unavailable(&skills, &turn_sink, waited.elapsed(), "срок прогона");
+                        record_skills_unavailable(
+                            &skills,
+                            &turn_sink,
+                            waited.elapsed(),
+                            "срок прогона",
+                        );
                         break;
                     }
                 }
@@ -1829,7 +1853,8 @@ impl Runtime {
             Ok(r) => r,
             Err(e) => {
                 let err = InvokeError::PromptRender(format!("{e}"));
-                self.fail_prepared_call(call_id, &req.agent, start, &err).await;
+                self.fail_prepared_call(call_id, &req.agent, start, &err)
+                    .await;
                 return Err(err);
             }
         };
@@ -1845,7 +1870,8 @@ impl Runtime {
                     estimated,
                     max: max_in,
                 };
-                self.fail_prepared_call(call_id, &req.agent, start, &err).await;
+                self.fail_prepared_call(call_id, &req.agent, start, &err)
+                    .await;
                 return Err(err);
             }
         }
@@ -1870,7 +1896,8 @@ impl Runtime {
                 let mut hints = match build_cli_hints(cli_cfg, &ctx) {
                     Ok(h) => h,
                     Err(err) => {
-                        self.fail_prepared_call(call_id, &req.agent, start, &err).await;
+                        self.fail_prepared_call(call_id, &req.agent, start, &err)
+                            .await;
                         return Err(err);
                     }
                 };
@@ -1886,7 +1913,8 @@ impl Runtime {
                     }
                     Err(message) => {
                         let err = InvokeError::McpConfig(message);
-                        self.fail_prepared_call(call_id, &req.agent, start, &err).await;
+                        self.fail_prepared_call(call_id, &req.agent, start, &err)
+                            .await;
                         return Err(err);
                     }
                 };
@@ -1895,59 +1923,58 @@ impl Runtime {
                 // провайдер не запускаем.
                 if let Some(roots) = &cli_cfg.allowed_roots {
                     if let Err(err) = ensure_cwd_within_agent_roots(hints.cwd.as_deref(), roots) {
-                        self.fail_prepared_call(call_id, &req.agent, start, &err).await;
+                        self.fail_prepared_call(call_id, &req.agent, start, &err)
+                            .await;
                         return Err(err);
                     }
                 }
                 if provider_name == "claude-cli" {
-                let resume_sid: Option<String> = match req.parent_call_id {
-                    Some(parent_id) => {
-                        match self.pg.get_call_session_id(parent_id).await {
+                    let resume_sid: Option<String> = match req.parent_call_id {
+                        Some(parent_id) => match self.pg.get_call_session_id(parent_id).await {
                             Ok(opt) => opt,
                             Err(e) => {
                                 warn!(error = %e, parent_id, "не прочитал parent session_id");
                                 None
                             }
-                        }
+                        },
+                        // Корневой вызов (parent_call_id == None) НИКОГДА не
+                        // переиспользует чужую сессию: ниже сгенерится новый UUID
+                        // и уйдёт как --session-id. Переиспользование между разными
+                        // корневыми задачами смешивало бы чужой контекст (разные
+                        // пользовательские запросы в одной claude-сессии).
+                        None => None,
+                    };
+
+                    // Финальный session_id текущего вызова — для раннего UPDATE.
+                    let final_sid: String = match &resume_sid {
+                        Some(sid) => sid.clone(),
+                        None => uuid::Uuid::new_v4().to_string(),
+                    };
+                    if let Some(sid) = resume_sid {
+                        info!(
+                            agent = %req.agent,
+                            parent_call_id = ?req.parent_call_id,
+                            session_id = %sid,
+                            "переиспользую сессию через --resume"
+                        );
+                        hints.resume_session_id = Some(sid);
+                    } else {
+                        info!(
+                            agent = %req.agent,
+                            session_id = %final_sid,
+                            "стартую новую сессию через --session-id"
+                        );
+                        hints.new_session_id = Some(final_sid.clone());
                     }
-                    // Корневой вызов (parent_call_id == None) НИКОГДА не
-                    // переиспользует чужую сессию: ниже сгенерится новый UUID
-                    // и уйдёт как --session-id. Переиспользование между разными
-                    // корневыми задачами смешивало бы чужой контекст (разные
-                    // пользовательские запросы в одной claude-сессии).
-                    None => None,
-                };
 
-                // Финальный session_id текущего вызова — для раннего UPDATE.
-                let final_sid: String = match &resume_sid {
-                    Some(sid) => sid.clone(),
-                    None => uuid::Uuid::new_v4().to_string(),
-                };
-                if let Some(sid) = resume_sid {
-                    info!(
-                        agent = %req.agent,
-                        parent_call_id = ?req.parent_call_id,
-                        session_id = %sid,
-                        "переиспользую сессию через --resume"
-                    );
-                    hints.resume_session_id = Some(sid);
-                } else {
-                    info!(
-                        agent = %req.agent,
-                        session_id = %final_sid,
-                        "стартую новую сессию через --session-id"
-                    );
-                    hints.new_session_id = Some(final_sid.clone());
-                }
-
-                // Ранний UPDATE pre-insert row: пишем session_id ДО старта
-                // claude-cli, чтобы дочерние invoke сразу его видели. Иначе
-                // shared-session не работает: дочерний попадает к нам по MCP
-                // пока parent.complete() в await'е, и read parent.session_id
-                // вернёт NULL.
-                if let Err(e) = self.pg.set_call_session_id(call_id, &final_sid).await {
-                    warn!(error = %e, call_id, "ранний UPDATE session_id упал");
-                }
+                    // Ранний UPDATE pre-insert row: пишем session_id ДО старта
+                    // claude-cli, чтобы дочерние invoke сразу его видели. Иначе
+                    // shared-session не работает: дочерний попадает к нам по MCP
+                    // пока parent.complete() в await'е, и read parent.session_id
+                    // вернёт NULL.
+                    if let Err(e) = self.pg.set_call_session_id(call_id, &final_sid).await {
+                        warn!(error = %e, call_id, "ранний UPDATE session_id упал");
+                    }
                 } // конец if provider_name == "claude-cli"
 
                 Some(hints)
@@ -2050,7 +2077,10 @@ fn spawn_turn_writer(
                 .and_then(|v| v.as_i64())
                 .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
             let record_text = rec.to_string();
-            if let Err(e) = store.append_turn(call_id, seq, &event, &record_text, ts).await {
+            if let Err(e) = store
+                .append_turn(call_id, seq, &event, &record_text, ts)
+                .await
+            {
                 tracing::warn!(call_id, seq, error = %e, "потоковая запись хода упала");
             }
         }
@@ -2065,11 +2095,12 @@ fn record_skills_unavailable(
     reason: &str,
 ) {
     let address = crate::providers::mcp_client::safe_server_address(skills.address());
-    let reason_kind = if reason.contains("срок") || reason.to_ascii_lowercase().contains("timed out") {
-        "срок"
-    } else {
-        "ошибка"
-    };
+    let reason_kind =
+        if reason.contains("срок") || reason.to_ascii_lowercase().contains("timed out") {
+            "срок"
+        } else {
+            "ошибка"
+        };
     warn!(
         address = %address,
         reason_kind,
@@ -2118,7 +2149,10 @@ async fn finish_timed_out_call(
             warn!(call_id, error = %e, "не удалось записать статус после истечения срока")
         }
         Err(_) => {
-            warn!(call_id, "запись статуса прервана: истекли 5 с из дополнительного срока")
+            warn!(
+                call_id,
+                "запись статуса прервана: истекли 5 с из дополнительного срока"
+            )
         }
     }
 }
@@ -2200,10 +2234,7 @@ async fn execute_ready_guarded(
     }
 }
 
-async fn execute_ready(
-    pg: Arc<dyn Store>,
-    ready: ReadyCall,
-) -> Result<CompletedCall, InvokeError> {
+async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<CompletedCall, InvokeError> {
     let ReadyCall {
         call_id,
         agent_name,
@@ -2252,8 +2283,8 @@ async fn execute_ready(
                     to,
                     cost,
                     start.elapsed().as_millis() as u64,
-                    None,    // session_id у неуспешных не сохраняем
-                    ti,      // raw_input ≈ tokens_in (openrouter без cache-разбивки)
+                    None, // session_id у неуспешных не сохраняем
+                    ti,   // raw_input ≈ tokens_in (openrouter без cache-разбивки)
                     0,
                     0,
                     None,
@@ -2335,9 +2366,8 @@ async fn execute_ready(
                             error = %e,
                             "ответ модели не валидный JSON даже после снятия fences, возвращаю как text"
                         );
-                        incomplete_reasons.push(
-                            "ответ format=json не удалось разобрать как JSON".to_string(),
-                        );
+                        incomplete_reasons
+                            .push("ответ format=json не удалось разобрать как JSON".to_string());
                         Value::String(llm_resp.content.clone())
                     }
                 }
@@ -2386,22 +2416,23 @@ async fn execute_ready(
 
     let output_json =
         serde_json::to_string(&response.result).map_err(|e| InvokeError::Db(format!("{e}")))?;
-    if let Err(write_error) = pg.update_call(
-        call_id,
-        call_status,
-        Some(&output_json),
-        incomplete_error.as_deref(),
-        llm_resp.tokens_in,
-        llm_resp.tokens_out,
-        llm_resp.cost_usd,
-        latency_ms,
-        llm_resp.session_id.as_deref(),
-        llm_resp.raw_input_tokens,
-        llm_resp.cache_creation_input_tokens,
-        llm_resp.cache_read_input_tokens,
-        llm_resp.reasoning.as_deref(),
-    )
-    .await
+    if let Err(write_error) = pg
+        .update_call(
+            call_id,
+            call_status,
+            Some(&output_json),
+            incomplete_error.as_deref(),
+            llm_resp.tokens_in,
+            llm_resp.tokens_out,
+            llm_resp.cost_usd,
+            latency_ms,
+            llm_resp.session_id.as_deref(),
+            llm_resp.raw_input_tokens,
+            llm_resp.cache_creation_input_tokens,
+            llm_resp.cache_read_input_tokens,
+            llm_resp.reasoning.as_deref(),
+        )
+        .await
     {
         let persistence_error = format!("не удалось записать итог вызова: {write_error}");
         error!(
@@ -2440,8 +2471,7 @@ async fn execute_ready(
     // Транскрипт уже в agent_turns: его пишет spawn_turn_writer по ходу прогона.
 
     // max_cost_usd — мягкая проверка: предупреждаем, но НЕ блокируем.
-    if let (Some(max_cost), Some(cost_usd)) =
-        (agent.config.limits.max_cost_usd, llm_resp.cost_usd)
+    if let (Some(max_cost), Some(cost_usd)) = (agent.config.limits.max_cost_usd, llm_resp.cost_usd)
     {
         if cost_usd > max_cost {
             warn!(
@@ -2474,22 +2504,21 @@ async fn execute_ready(
     // Поймано 24.08.2026: DeepSeek Flash обрывал JSON по пределу вывода, обрывок
     // осел в кеше, и повторы падали мгновенно с тем же обрывом.
     if let Some(key) = cache_key {
-        if incomplete_error.is_some() {
+        if let Some(error) = incomplete_error {
             warn!(
                 agent = %response.metadata.agent,
                 "неполный ответ — в кеш не кладу"
             );
-            return Ok(CompletedCall::Incomplete {
-                response,
-                error: incomplete_error.expect("причина неполного результата есть"),
-            });
+            return Ok(CompletedCall::Incomplete { response, error });
         }
         let output_json = serde_json::to_string(&response.result).unwrap_or_default();
         let metadata_json = serde_json::to_string(&response.metadata).unwrap_or_default();
         let ttl = agent.config.cache.ttl_sec;
         let cache_pg = pg.clone();
         tokio::spawn(async move {
-            if let Err(e) = cache::store(cache_pg.as_ref(), key, output_json, metadata_json, ttl).await {
+            if let Err(e) =
+                cache::store(cache_pg.as_ref(), key, output_json, metadata_json, ttl).await
+            {
                 warn!(error = %e, "cache store упал");
             }
         });
@@ -2525,9 +2554,7 @@ pub(crate) fn orphan_result_path(runs_dir: &Path, call: &OrphanedCall) -> PathBu
 /// Удалить старые JSON-итоги из `runs_dir`. Срок должен совпадать с retention
 /// строк `agent_calls`, иначе один из двух журналов снова начнёт расти без меры.
 pub(crate) fn cleanup_result_files(runs_dir: &Path, ttl: Duration) -> u64 {
-    let cutoff = SystemTime::now()
-        .checked_sub(ttl)
-        .unwrap_or(UNIX_EPOCH);
+    let cutoff = SystemTime::now().checked_sub(ttl).unwrap_or(UNIX_EPOCH);
     cleanup_result_files_before(runs_dir, cutoff)
 }
 
@@ -2686,7 +2713,7 @@ async fn poll_call(pg: Arc<dyn Store>, call_id: i64, wait_sec: u64) -> InvokeOut
     loop {
         match read_call_outcome(pg.clone(), call_id).await {
             Ok(Some(outcome)) => return outcome, // done / error / не найден
-            Ok(None) => {}                        // ещё running
+            Ok(None) => {}                       // ещё running
             Err(e) => {
                 warn!(call_id, error = %e, "poll_call: чтение строки упало");
                 return InvokeOutcome::PersistenceFailed {
@@ -2918,13 +2945,12 @@ fn build_response_from_cache(
 /// рабочий каталог вызова обязан быть задан и лежать внутри хотя бы одного
 /// корня агента. Корни, которые не удалось канонизировать, пропускаются —
 /// как в fs_safe_path.
-fn ensure_cwd_within_agent_roots(
-    cwd: Option<&Path>,
-    roots: &[PathBuf],
-) -> Result<(), InvokeError> {
+fn ensure_cwd_within_agent_roots(cwd: Option<&Path>, roots: &[PathBuf]) -> Result<(), InvokeError> {
     let cwd = cwd.ok_or(InvokeError::AgentRootsWorkDirMissing)?;
-    let roots_text: Vec<String> =
-        roots.iter().map(|root| root.display().to_string()).collect();
+    let roots_text: Vec<String> = roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
     let cwd_resolved = crate::server::canonicalize_with_missing(cwd).map_err(|_| {
         InvokeError::WorkDirOutsideAgentRoots {
             cwd: cwd.display().to_string(),
@@ -2935,7 +2961,10 @@ fn ensure_cwd_within_agent_roots(
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())
         .collect();
-    if !canonical_roots.iter().any(|root| cwd_resolved.starts_with(root)) {
+    if !canonical_roots
+        .iter()
+        .any(|root| cwd_resolved.starts_with(root))
+    {
         return Err(InvokeError::WorkDirOutsideAgentRoots {
             cwd: cwd.display().to_string(),
             roots: roots_text,
@@ -3025,7 +3054,9 @@ fn is_own_mcp_url(raw: &str, port: u16) -> bool {
         return false;
     };
     let host_ok = matches!(
-        url.host_str().map(|host| host.to_ascii_lowercase()).as_deref(),
+        url.host_str()
+            .map(|host| host.to_ascii_lowercase())
+            .as_deref(),
         Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
     );
     matches!(url.scheme(), "http" | "https")
@@ -3055,7 +3086,9 @@ fn inject_call_key_into_mcp_config(raw: &str, port: u16, key: &str) -> String {
         let Some(config) = config.as_object_mut() else {
             continue;
         };
-        let headers = config.entry("headers").or_insert_with(|| Value::Object(Map::new()));
+        let headers = config
+            .entry("headers")
+            .or_insert_with(|| Value::Object(Map::new()));
         if !headers.is_object() {
             *headers = Value::Object(Map::new());
         }
@@ -3108,12 +3141,8 @@ mod tests {
         })
         .to_string();
 
-        let updated: Value = serde_json::from_str(&inject_call_key_into_mcp_config(
-            &raw,
-            8025,
-            "new-key",
-        ))
-        .unwrap();
+        let updated: Value =
+            serde_json::from_str(&inject_call_key_into_mcp_config(&raw, 8025, "new-key")).unwrap();
         assert_eq!(
             updated["mcpServers"]["agents-mcp"]["headers"][CALL_KEY_HEADER],
             "new-key"
@@ -3122,11 +3151,9 @@ mod tests {
             updated["mcpServers"]["agents-mcp"]["headers"]["Authorization"],
             "Bearer keep"
         );
-        assert!(
-            updated["mcpServers"]["foreign"]["headers"]
-                .get(CALL_KEY_HEADER)
-                .is_none()
-        );
+        assert!(updated["mcpServers"]["foreign"]["headers"]
+            .get(CALL_KEY_HEADER)
+            .is_none());
     }
 
     #[test]
@@ -3152,10 +3179,8 @@ mod tests {
         // Ради этого файла и затеян agent_run: читатель ждёт его появления и
         // обязан увидеть JSON целиком. Проверяем, что временного огрызка на
         // месте итога не остаётся и конверт разбирается.
-        let dir = std::env::temp_dir().join(format!(
-            "agents-mcp-result-test-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-result-test-{}", uuid::Uuid::new_v4()));
         let root = dir.join("root");
         let path = root.join("вложенный").join("42-mock-agent.json");
         let old_shared_tmp = root.with_extension("json.part");
@@ -3184,7 +3209,10 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".part"))
             .collect();
-        assert!(leftovers.is_empty(), "временные файлы не должны оставаться: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "временные файлы не должны оставаться: {leftovers:?}"
+        );
 
         // Повторная запись поверх существующего итога не должна падать
         // (Windows: rename на занятое имя).
@@ -3337,15 +3365,9 @@ mod tests {
             output_json: "{\"ok\":true}".into(),
             metadata_json: serde_json::to_string(&meta).unwrap(),
         };
-        let resp = build_response_from_cache(
-            "agent-new",
-            "v2",
-            &entry,
-            Instant::now(),
-            Some(42),
-            3,
-        )
-        .expect("должен восстановиться");
+        let resp =
+            build_response_from_cache("agent-new", "v2", &entry, Instant::now(), Some(42), 3)
+                .expect("должен восстановиться");
         assert!(resp.metadata.cached);
         assert_eq!(resp.metadata.agent, "agent-new");
         assert_eq!(resp.metadata.variant, "v2");
@@ -3360,7 +3382,9 @@ mod tests {
             output_json: "не json".into(),
             metadata_json: "тоже не json".into(),
         };
-        assert!(build_response_from_cache("a", "default", &entry, Instant::now(), None, 0).is_none());
+        assert!(
+            build_response_from_cache("a", "default", &entry, Instant::now(), None, 0).is_none()
+        );
     }
 
     // ── Лимиты и валидация схемы (фича б) ───────────────────────────────
@@ -3372,7 +3396,12 @@ mod tests {
         assert_eq!(estimate_tokens(&"x".repeat(400)), 100);
     }
 
-    fn art(kind: &str, key: &str, content: Option<&str>, summary: Option<&str>) -> crate::store::Artifact {
+    fn art(
+        kind: &str,
+        key: &str,
+        content: Option<&str>,
+        summary: Option<&str>,
+    ) -> crate::store::Artifact {
         crate::store::Artifact {
             id: 0,
             kind: kind.into(),
@@ -3399,13 +3428,19 @@ mod tests {
         ];
         let s = format_task_context(&arts);
         assert!(s.contains("[metadata] meta.X — про X"), "s={s}");
-        assert!(s.contains("короткий"), "короткий content должен влиться целиком");
+        assert!(
+            s.contains("короткий"),
+            "короткий content должен влиться целиком"
+        );
         assert!(s.contains("[bsl_module] ObjectModule"), "s={s}");
         assert!(
             s.contains("прочитать через artifact_read"),
             "длинный content должен быть заменён намёком"
         );
-        assert!(!s.contains(&"я".repeat(1000)), "длинный content не должен вливаться целиком");
+        assert!(
+            !s.contains(&"я".repeat(1000)),
+            "длинный content не должен вливаться целиком"
+        );
     }
 
     #[test]
@@ -3425,12 +3460,25 @@ mod tests {
 
         // 30 артефактов по 600 символов content: заголовки видны у всех, content — пока есть запас.
         let arts: Vec<_> = (0..30)
-            .map(|i| art("metadata", &format!("meta.{i}"), Some(&"я".repeat(600)), Some("сводка")))
+            .map(|i| {
+                art(
+                    "metadata",
+                    &format!("meta.{i}"),
+                    Some(&"я".repeat(600)),
+                    Some("сводка"),
+                )
+            })
             .collect();
         let s = format_task_context(&arts);
         assert!(s.chars().count() <= 6000, "len={}", s.chars().count());
-        assert!(s.contains("[metadata] meta.29 — сводка"), "заголовки не отбрасываются");
-        assert!(s.contains(&"я".repeat(600)), "первые content попадают в срез");
+        assert!(
+            s.contains("[metadata] meta.29 — сводка"),
+            "заголовки не отбрасываются"
+        );
+        assert!(
+            s.contains(&"я".repeat(600)),
+            "первые content попадают в срез"
+        );
 
         // Заголовков больше, чем помещается: строгий предел и строка «ещё N».
         let many: Vec<_> = (0..2000)
@@ -3503,13 +3551,21 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn session_helpers_pg_round_trip() {
-        let dsn =
-            std::env::var("AGENTS_MCP_TEST_PG_DSN").expect("AGENTS_MCP_TEST_PG_DSN не задан");
+        let dsn = std::env::var("AGENTS_MCP_TEST_PG_DSN").expect("AGENTS_MCP_TEST_PG_DSN не задан");
         let pg: Arc<dyn Store> =
             Arc::new(crate::store::PgStore::connect(&dsn, 2).expect("connect"));
 
         let id = pg
-            .insert_call_stub("orch", "default", "h", "sonnet", "claude-cli", None, None, "test:1")
+            .insert_call_stub(
+                "orch",
+                "default",
+                "h",
+                "sonnet",
+                "claude-cli",
+                None,
+                None,
+                "test:1",
+            )
             .await
             .unwrap();
         // До раннего UPDATE session_id == NULL.
@@ -3599,11 +3655,8 @@ mod tests {
             &self,
             req: LlmRequest,
         ) -> Result<crate::providers::LlmResponse, LlmError> {
-            *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(
-                req.cli_hints
-                    .expect("подсказки исполнения")
-                    .mcp_env,
-            );
+            *self.seen.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(req.cli_hints.expect("подсказки исполнения").mcp_env);
             Ok(crate::providers::LlmResponse {
                 content: "ok".into(),
                 tokens_in: 1,
@@ -3677,7 +3730,10 @@ mod tests {
                 .expect("ключ добавлен независимо от алиаса")
                 .to_string();
             assert!(
-                self.scopes.lock().unwrap_or_else(|e| e.into_inner()).contains_key(&key),
+                self.scopes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&key),
                 "во время provider.complete ключ должен быть действителен"
             );
             *self.seen_key.lock().unwrap_or_else(|e| e.into_inner()) = Some(key);
@@ -3716,9 +3772,8 @@ mod tests {
         )
         .unwrap();
         std::fs::write(agent_dir.join("prompt.md"), "ok").unwrap();
-        let store: Arc<dyn Store> = Arc::new(
-            crate::store::SqliteStore::open(Path::new(":memory:")).unwrap(),
-        );
+        let store: Arc<dyn Store> =
+            Arc::new(crate::store::SqliteStore::open(Path::new(":memory:")).unwrap());
         let registry = Arc::new(Registry::load(dir.join("agents")).unwrap());
         let runtime = Runtime::new(
             store,
@@ -3740,13 +3795,19 @@ mod tests {
             }) as Arc<dyn LlmProvider>,
         )]));
 
-        runtime.invoke(invoke_req("direct-key", None)).await.unwrap();
+        runtime
+            .invoke(invoke_req("direct-key", None))
+            .await
+            .unwrap();
         let key = seen_key
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .expect("провайдер увидел ключ");
-        assert!(runtime.call_scope(&key).is_none(), "после завершения ключ снят");
+        assert!(
+            runtime.call_scope(&key).is_none(),
+            "после завершения ключ снят"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3814,7 +3875,9 @@ mod tests {
         let (runtime, _store, _base) = fixed_runtime(extra_config, "ok", "stop", false);
         runtime.set_providers(HashMap::from([(
             "fixed".to_string(),
-            Arc::new(CountingProvider { calls: Arc::clone(calls) }) as Arc<dyn LlmProvider>,
+            Arc::new(CountingProvider {
+                calls: Arc::clone(calls),
+            }) as Arc<dyn LlmProvider>,
         )]));
         runtime
     }
@@ -3838,12 +3901,20 @@ mod tests {
             matches!(&err, InvokeError::WorkDirOutsideAgentRoots { .. }),
             "получено: {err}"
         );
-        let InvokeError::WorkDirOutsideAgentRoots { cwd: err_cwd, roots: err_roots } = err else {
+        let InvokeError::WorkDirOutsideAgentRoots {
+            cwd: err_cwd,
+            roots: err_roots,
+        } = err
+        else {
             unreachable!("проверено matches! выше")
         };
         assert!(err_cwd.contains("elsewhere"), "cwd = {err_cwd}");
         assert_eq!(err_roots, vec![root.to_string_lossy().replace('\\', "/")]);
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "провайдер не должен вызываться");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "провайдер не должен вызываться"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3881,7 +3952,11 @@ mod tests {
             matches!(&err, InvokeError::AgentRootsWorkDirMissing),
             "получено: {err}"
         );
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "провайдер не должен вызываться");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "провайдер не должен вызываться"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -3889,10 +3964,7 @@ mod tests {
         extra_config: &str,
         prompt: &str,
     ) -> (Runtime, Arc<dyn Store>, Arc<Registry>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "agents-mcp-cache-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = std::env::temp_dir().join(format!("agents-mcp-cache-{}", uuid::Uuid::new_v4()));
         let agent_dir = dir.join("agents/test");
         std::fs::create_dir_all(&agent_dir).expect("каталог агента");
         std::fs::write(
@@ -3905,8 +3977,7 @@ mod tests {
         std::fs::write(agent_dir.join("prompt.md"), prompt).expect("prompt.md агента");
 
         let store: Arc<dyn Store> = Arc::new(
-            crate::store::SqliteStore::open(Path::new(":memory:"))
-                .expect("хранилище журнала"),
+            crate::store::SqliteStore::open(Path::new(":memory:")).expect("хранилище журнала"),
         );
         let registry = Arc::new(Registry::load(dir.join("agents")).expect("реестр агентов"));
         let providers = HashMap::from([(
@@ -3939,7 +4010,9 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         runtime.set_providers(HashMap::from([(
             "fixed".to_string(),
-            Arc::new(CountingProvider { calls: Arc::clone(&calls) }) as Arc<dyn LlmProvider>,
+            Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn LlmProvider>,
         )]));
 
         let error = runtime
@@ -3968,7 +4041,9 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(None));
         runtime.set_providers(HashMap::from([(
             "fixed".to_string(),
-            Arc::new(McpEnvInspectProvider { seen: Arc::clone(&seen) }) as Arc<dyn LlmProvider>,
+            Arc::new(McpEnvInspectProvider {
+                seen: Arc::clone(&seen),
+            }) as Arc<dyn LlmProvider>,
         )]));
 
         runtime.invoke(cache_req()).await.expect("вызов проходит");
@@ -3991,10 +4066,8 @@ mod tests {
         finish_reason: &'static str,
         panic: bool,
     ) -> (Runtime, Arc<crate::store::SqliteStore>, PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "agents-mcp-result-status-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-result-status-{}", uuid::Uuid::new_v4()));
         let agent_dir = dir.join("agents/test");
         std::fs::create_dir_all(&agent_dir).expect("каталог агента");
         std::fs::write(
@@ -4007,8 +4080,7 @@ mod tests {
         std::fs::write(agent_dir.join("prompt.md"), prompt).expect("prompt.md агента");
 
         let store = Arc::new(
-            crate::store::SqliteStore::open(Path::new(":memory:"))
-                .expect("хранилище журнала"),
+            crate::store::SqliteStore::open(Path::new(":memory:")).expect("хранилище журнала"),
         );
         let registry = Arc::new(Registry::load(dir.join("agents")).expect("реестр агентов"));
         let providers = HashMap::from([(
@@ -4156,7 +4228,12 @@ mod tests {
 
     async fn wait_for_cache(store: &dyn Store, key: &str) {
         for _ in 0..100 {
-            if store.cache_lookup(key).await.expect("чтение кеша").is_some() {
+            if store
+                .cache_lookup(key)
+                .await
+                .expect("чтение кеша")
+                .is_some()
+            {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
@@ -4166,22 +4243,21 @@ mod tests {
 
     #[tokio::test]
     async fn cache_separates_forced_model() {
-        let (runtime, store, _registry, dir) =
-            cache_runtime("[cache]\nenabled = true", "answer");
+        let (runtime, store, _registry, dir) = cache_runtime("[cache]\nenabled = true", "answer");
         let request = cache_req();
         let first = sync_response(runtime.invoke(request.clone()).await.expect("первый вызов"));
         assert!(!first.metadata.cached);
-        let first_key = cache::compute_key(
-            "test",
-            "default",
-            "fixed",
-            "configured",
-            "answer",
-            "",
-            &request.input,
-            &[],
-            None,
-        );
+        let first_key = cache::compute_key(cache::CacheKeyParts {
+            agent_name: "test",
+            variant: "default",
+            provider_name: "fixed",
+            model_name: "configured",
+            prompt: "answer",
+            task_context: "",
+            input: &request.input,
+            key_fields: &[],
+            task_id: None,
+        });
         wait_for_cache(store.as_ref(), &first_key).await;
 
         *runtime.force_override.write().expect("override") = ModelOverride {
@@ -4202,24 +4278,21 @@ mod tests {
         let request = cache_req();
         let first = sync_response(runtime.invoke(request.clone()).await.expect("первый вызов"));
         assert!(!first.metadata.cached);
-        let first_key = cache::compute_key(
-            "test",
-            "default",
-            "fixed",
-            "configured",
-            "prompt-version-one",
-            "",
-            &request.input,
-            &[],
-            None,
-        );
+        let first_key = cache::compute_key(cache::CacheKeyParts {
+            agent_name: "test",
+            variant: "default",
+            provider_name: "fixed",
+            model_name: "configured",
+            prompt: "prompt-version-one",
+            task_context: "",
+            input: &request.input,
+            key_fields: &[],
+            task_id: None,
+        });
         wait_for_cache(store.as_ref(), &first_key).await;
 
-        std::fs::write(
-            dir.join("agents/test/prompt.md"),
-            "prompt-version-two",
-        )
-        .expect("обновление prompt.md");
+        std::fs::write(dir.join("agents/test/prompt.md"), "prompt-version-two")
+            .expect("обновление prompt.md");
         registry.reload().expect("перечитка реестра");
         let second = sync_response(runtime.invoke(request).await.expect("второй вызов"));
         assert!(!second.metadata.cached);
@@ -4261,17 +4334,17 @@ mod tests {
         assert!(first_context.chars().count() <= 6000);
         assert!(!first_context.contains("-one"));
         assert_eq!(first.result.as_str().expect("текст"), first_context);
-        let first_key = cache::compute_key(
-            "test",
-            "default",
-            "fixed",
-            "configured",
-            "{{ task_context }}",
-            &task_context_fingerprint(&first_artifacts),
-            &request.input,
-            &[],
-            Some(task_id),
-        );
+        let first_key = cache::compute_key(cache::CacheKeyParts {
+            agent_name: "test",
+            variant: "default",
+            provider_name: "fixed",
+            model_name: "configured",
+            prompt: "{{ task_context }}",
+            task_context: &task_context_fingerprint(&first_artifacts),
+            input: &request.input,
+            key_fields: &[],
+            task_id: Some(task_id),
+        });
         wait_for_cache(store.as_ref(), &first_key).await;
 
         store
@@ -4300,17 +4373,17 @@ mod tests {
             cache_runtime("[cache]\nenabled = true", "same prompt");
         let request = cache_req();
         let first = sync_response(runtime.invoke(request.clone()).await.expect("первый вызов"));
-        let key = cache::compute_key(
-            "test",
-            "default",
-            "fixed",
-            "configured",
-            "same prompt",
-            "",
-            &request.input,
-            &[],
-            None,
-        );
+        let key = cache::compute_key(cache::CacheKeyParts {
+            agent_name: "test",
+            variant: "default",
+            provider_name: "fixed",
+            model_name: "configured",
+            prompt: "same prompt",
+            task_context: "",
+            input: &request.input,
+            key_fields: &[],
+            task_id: None,
+        });
         wait_for_cache(store.as_ref(), &key).await;
 
         let second = sync_response(runtime.invoke(request).await.expect("второй вызов"));
@@ -4334,17 +4407,17 @@ mod tests {
         let request = cache_req();
         let first = sync_response(runtime.invoke(request.clone()).await.expect("первый вызов"));
         assert!(!first.metadata.cached);
-        let key = cache::compute_key(
-            "test",
-            "default",
-            "fixed",
-            "configured",
-            "same prompt",
-            "",
-            &request.input,
-            &[],
-            None,
-        );
+        let key = cache::compute_key(cache::CacheKeyParts {
+            agent_name: "test",
+            variant: "default",
+            provider_name: "fixed",
+            model_name: "configured",
+            prompt: "same prompt",
+            task_context: "",
+            input: &request.input,
+            key_fields: &[],
+            task_id: None,
+        });
         wait_for_cache(store.as_ref(), &key).await;
         runtime.set_provider_env(ProviderEnv::default());
 
@@ -4397,9 +4470,15 @@ mod tests {
         );
         assert!(second_path.exists(), "кеш-попадание пишет свой файл-итог");
         let history = runtime.history(None, None, 10).await.expect("история");
-        assert_eq!(history.len(), 2, "кеш-попадание создаёт новую строку вызова");
+        assert_eq!(
+            history.len(),
+            2,
+            "кеш-попадание создаёт новую строку вызова"
+        );
         assert!(
-            history.iter().any(|entry| entry.id == second_response.metadata.call_id && entry.cached),
+            history
+                .iter()
+                .any(|entry| entry.id == second_response.metadata.call_id && entry.cached),
             "строка кеш-попадания помечена cached"
         );
 
@@ -4448,7 +4527,8 @@ mod tests {
             .insert("fixed".into(), Arc::new(PendingProvider));
         let mut request = cache_req();
         request.wait_sec = Some(0);
-        let call_id = match runtime.invoke(request).await.expect("асинхронный запуск") {
+        let call_id = match runtime.invoke(request).await.expect("асинхронный запуск")
+        {
             InvokeOutcome::Running { call_id, .. } => call_id,
             _ => panic!("ожидался запущенный вызов"),
         };
@@ -4467,10 +4547,8 @@ mod tests {
 
     #[test]
     fn orphan_result_path_uses_saved_explicit_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "agents-mcp-orphan-result-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-orphan-result-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("каталог");
         let expected = dir.join("explicit-result.json");
         let call = OrphanedCall {
@@ -4482,8 +4560,11 @@ mod tests {
 
         let path = orphan_result_path(&dir, &call);
         assert_eq!(path, expected);
-        write_result_file(&path, &envelope_error(call.id, &call.agent_name, "перезапуск"))
-            .expect("конверт осиротевшего вызова");
+        write_result_file(
+            &path,
+            &envelope_error(call.id, &call.agent_name, "перезапуск"),
+        )
+        .expect("конверт осиротевшего вызова");
         assert!(path.exists());
         assert!(
             !dir.join("42-worker.json").exists(),
@@ -4575,7 +4656,10 @@ mod tests {
             .await
             .expect("чтение строки вызова")
             .expect("строка вызова есть");
-        assert_ne!(row.status, "running", "строка не должна остаться в 'running'");
+        assert_ne!(
+            row.status, "running",
+            "строка не должна остаться в 'running'"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4623,9 +4707,7 @@ mod tests {
         let child = runtime.invoke(invoke_req("drain-agent", Some(999))).await;
         assert!(child.is_ok(), "дочерний вызов идущего принимается");
 
-        let stranger = runtime
-            .invoke(invoke_req("drain-agent", Some(12345)))
-            .await;
+        let stranger = runtime.invoke(invoke_req("drain-agent", Some(12345))).await;
         assert!(
             matches!(stranger, Err(InvokeError::ShuttingDown)),
             "вызов с неживым родителем отклоняется"
@@ -4743,8 +4825,7 @@ mod tests {
         assert_eq!(runtime.run_timeout(&cache_req()).unwrap(), 7);
         let _ = std::fs::remove_dir_all(&dir);
 
-        let (runtime, _, _, dir) =
-            cache_runtime("[limits]\ntimeout_sec = 11", "answer");
+        let (runtime, _, _, dir) = cache_runtime("[limits]\ntimeout_sec = 11", "answer");
         runtime.set_default_timeout_sec(7);
         assert_eq!(runtime.run_timeout(&cache_req()).unwrap(), 11);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4752,8 +4833,7 @@ mod tests {
 
     #[tokio::test]
     async fn overall_timeout_closes_background_and_sync_calls() {
-        let (runtime, store, _, dir) =
-            cache_runtime("[limits]\ntimeout_sec = 1", "answer");
+        let (runtime, store, _, dir) = cache_runtime("[limits]\ntimeout_sec = 1", "answer");
         runtime.set_providers(HashMap::from([(
             "fixed".to_string(),
             Arc::new(PendingProvider) as Arc<dyn LlmProvider>,
@@ -4776,8 +4856,7 @@ mod tests {
         assert_eq!(row.status, "error");
         let _ = std::fs::remove_dir_all(&dir);
 
-        let (runtime, _, _, dir) =
-            cache_runtime("[limits]\ntimeout_sec = 1", "answer");
+        let (runtime, _, _, dir) = cache_runtime("[limits]\ntimeout_sec = 1", "answer");
         runtime.set_providers(HashMap::from([(
             "fixed".to_string(),
             Arc::new(PendingProvider) as Arc<dyn LlmProvider>,
@@ -4815,8 +4894,7 @@ mod tests {
         .unwrap();
         std::fs::write(agent_dir.join("prompt.md"), "{{ skills_index }}done").unwrap();
         let db_path = dir.join("store.sqlite");
-        let store: Arc<dyn Store> =
-            Arc::new(crate::store::SqliteStore::open(&db_path).unwrap());
+        let store: Arc<dyn Store> = Arc::new(crate::store::SqliteStore::open(&db_path).unwrap());
         let registry = Arc::new(Registry::load(dir.join("agents")).unwrap());
         let providers = HashMap::from([(
             "fixed".to_string(),
@@ -4829,10 +4907,7 @@ mod tests {
             store,
             registry,
             providers,
-            crate::skills::SkillsClient::with_test_timeouts(
-                url,
-                Duration::from_millis(100),
-            ),
+            crate::skills::SkillsClient::with_test_timeouts(url, Duration::from_millis(100)),
             Arc::new(std::sync::RwLock::new(ModelOverride::default())),
             dir.join("runs"),
             "test:skills".into(),

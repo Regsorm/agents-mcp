@@ -26,8 +26,12 @@ use crate::config::{Config, ProviderApi, ProvidersConfig};
 use crate::errors::safe_config_error;
 use crate::health::ProviderStatus;
 use crate::providers::{
-    anthropic::AnthropicProvider, claude_cli::ClaudeCliProvider, codex_cli::CodexCliProvider,
-    mock::MockProvider, openrouter::OpenRouterProvider, LlmProvider,
+    anthropic::{AnthropicOptions, AnthropicProvider},
+    claude_cli::ClaudeCliProvider,
+    codex_cli::CodexCliProvider,
+    mock::MockProvider,
+    openrouter::{OpenRouterOptions, OpenRouterProvider},
+    LlmProvider,
 };
 use crate::registry::Registry;
 use crate::runtime::{Runtime, SharedOverride};
@@ -116,7 +120,13 @@ fn line_number(source: &str, error: &dotenvy::Error, search_from: &mut usize) ->
     let relative = source.get(*search_from..)?.find(text)?;
     let offset = *search_from + relative;
     *search_from = offset + text.len();
-    Some(source[..offset].bytes().filter(|byte| *byte == b'\n').count() + 1)
+    Some(
+        source[..offset]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            + 1,
+    )
 }
 
 fn load_dotenv_path(path: &Path) -> DotenvValues {
@@ -190,7 +200,7 @@ pub struct ProviderSet {
 /// Предупреждать ли о пропуске провайдера: при старте — всегда, при перечитке —
 /// только если в прошлой сборке он пропущен не был.
 fn warn_skip(prev: Option<&ProviderSet>, name: &str) -> bool {
-    prev.map_or(true, |p| !p.skipped.contains(name))
+    prev.is_none_or(|p| !p.skipped.contains(name))
 }
 
 /// Что изменилось в наборе провайдеров за одну сборку (имена, по алфавиту).
@@ -251,22 +261,26 @@ pub async fn build_providers(
         if !skipped.contains("openrouter") {
             match provider_env_var(env, &entry.api_key_env) {
                 Some(key) if !key.is_empty() => {
-                    let fp = fingerprint_with_key_and_proxy(&format!("{:?}", entry), &key, proxy.as_deref());
+                    let fp = fingerprint_with_key_and_proxy(
+                        &format!("{:?}", entry),
+                        &key,
+                        proxy.as_deref(),
+                    );
                     match reuse_prev(prev, "openrouter", &fp) {
                         Some(provider) => {
                             providers.insert("openrouter".into(), provider);
                         }
                         None => {
-                            let provider = OpenRouterProvider::new(
-                                "openrouter",
-                                key,
-                                entry.base_url.clone(),
-                                entry.default_referer.clone(),
+                            let provider = OpenRouterProvider::new(OpenRouterOptions {
+                                name: "openrouter".into(),
+                                api_key: key,
+                                base_url: entry.base_url.clone(),
+                                referer: entry.default_referer.clone(),
                                 proxy,
-                                entry.proxy_bypass.clone(),
-                                entry.max_concurrent,
-                                entry.prices.clone(),
-                            );
+                                proxy_bypass: entry.proxy_bypass.clone(),
+                                max_concurrent: entry.max_concurrent,
+                                prices: entry.prices.clone(),
+                            });
                             providers.insert("openrouter".into(), Arc::new(provider));
                             info!(env = %entry.api_key_env, "провайдер openrouter подключён");
                         }
@@ -310,22 +324,26 @@ pub async fn build_providers(
         if !skipped.contains("anthropic") {
             match provider_env_var(env, &entry.api_key_env) {
                 Some(key) if !key.is_empty() => {
-                    let fp = fingerprint_with_key_and_proxy(&format!("{:?}", entry), &key, proxy.as_deref());
+                    let fp = fingerprint_with_key_and_proxy(
+                        &format!("{:?}", entry),
+                        &key,
+                        proxy.as_deref(),
+                    );
                     match reuse_prev(prev, "anthropic", &fp) {
                         Some(provider) => {
                             providers.insert("anthropic".into(), provider);
                         }
                         None => {
-                            let provider = AnthropicProvider::new(
-                                "anthropic".into(),
-                                key,
-                                entry.base_url.clone(),
+                            let provider = AnthropicProvider::new(AnthropicOptions {
+                                name: "anthropic".into(),
+                                api_key: key,
+                                base_url: entry.base_url.clone(),
                                 proxy,
-                                entry.proxy_bypass.clone(),
-                                entry.max_concurrent,
-                                entry.prompt_cache,
-                                entry.prices.clone(),
-                            );
+                                proxy_bypass: entry.proxy_bypass.clone(),
+                                max_concurrent: entry.max_concurrent,
+                                prompt_cache: entry.prompt_cache,
+                                prices: entry.prices.clone(),
+                            });
                             providers.insert("anthropic".into(), Arc::new(provider));
                             info!(env = %entry.api_key_env, "провайдер anthropic подключён");
                         }
@@ -376,37 +394,40 @@ pub async fn build_providers(
         };
         match provider_env_var(env, &entry.api_key_env) {
             Some(key) if !key.is_empty() => {
-                let fp = fingerprint_with_key_and_proxy(&format!("{:?}", entry), &key, proxy.as_deref());
+                let fp =
+                    fingerprint_with_key_and_proxy(&format!("{:?}", entry), &key, proxy.as_deref());
                 match reuse_prev(prev, name, &fp) {
                     Some(provider) => {
                         providers.insert(name.clone(), provider);
                     }
                     None => {
-                        let provider: Arc<dyn LlmProvider> = match entry
-                            .api
-                            .unwrap_or(ProviderApi::Openai)
-                        {
-                            ProviderApi::Openai => Arc::new(OpenRouterProvider::new(
-                                name.clone(),
-                                key,
-                                entry.base_url.clone(),
-                                entry.default_referer.clone(),
-                                proxy.clone(),
-                                entry.proxy_bypass.clone(),
-                                entry.max_concurrent,
-                                entry.prices.clone(),
-                            )),
-                            ProviderApi::Anthropic => Arc::new(AnthropicProvider::new(
-                                name.clone(),
-                                key,
-                                entry.base_url.clone(),
-                                proxy.clone(),
-                                entry.proxy_bypass.clone(),
-                                entry.max_concurrent,
-                                entry.prompt_cache,
-                                entry.prices.clone(),
-                            )),
-                        };
+                        let provider: Arc<dyn LlmProvider> =
+                            match entry.api.unwrap_or(ProviderApi::Openai) {
+                                ProviderApi::Openai => {
+                                    Arc::new(OpenRouterProvider::new(OpenRouterOptions {
+                                        name: name.clone(),
+                                        api_key: key,
+                                        base_url: entry.base_url.clone(),
+                                        referer: entry.default_referer.clone(),
+                                        proxy: proxy.clone(),
+                                        proxy_bypass: entry.proxy_bypass.clone(),
+                                        max_concurrent: entry.max_concurrent,
+                                        prices: entry.prices.clone(),
+                                    }))
+                                }
+                                ProviderApi::Anthropic => {
+                                    Arc::new(AnthropicProvider::new(AnthropicOptions {
+                                        name: name.clone(),
+                                        api_key: key,
+                                        base_url: entry.base_url.clone(),
+                                        proxy: proxy.clone(),
+                                        proxy_bypass: entry.proxy_bypass.clone(),
+                                        max_concurrent: entry.max_concurrent,
+                                        prompt_cache: entry.prompt_cache,
+                                        prices: entry.prices.clone(),
+                                    }))
+                                }
+                            };
                         providers.insert(name.clone(), provider);
                         info!(provider = %name, env = %entry.api_key_env, "прямой провайдер подключён");
                     }
@@ -546,12 +567,11 @@ fn sha256_hex(text: &str) -> String {
 
 /// Отпечаток настройки провайдера вместе со значением ключа (в открытом виде
 /// ключ не хранится — только хеш).
-fn fingerprint_with_key_and_proxy(
-    entry_debug: &str,
-    key: &str,
-    proxy: Option<&str>,
-) -> String {
-    sha256_hex(&format!("{entry_debug}\u{0}{key}\u{0}{}", proxy.unwrap_or_default()))
+fn fingerprint_with_key_and_proxy(entry_debug: &str, key: &str, proxy: Option<&str>) -> String {
+    sha256_hex(&format!(
+        "{entry_debug}\u{0}{key}\u{0}{}",
+        proxy.unwrap_or_default()
+    ))
 }
 
 /// Отпечаток секции без ключа — у claude-cli/codex-cli ключа нет.
@@ -781,10 +801,7 @@ impl ConfigReloader {
 
     fn warn_service_path_overlaps(&self) {
         let roots = self.fs_roots.read().unwrap_or_else(|e| e.into_inner());
-        let service_paths = self
-            .service_paths
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
+        let service_paths = self.service_paths.read().unwrap_or_else(|e| e.into_inner());
         for warning in service_path_overlap_warnings(&roots, &service_paths) {
             warn!("{warning}");
         }
@@ -872,9 +889,12 @@ impl ConfigReloader {
 
         // Перечитка обновляет только собственную карту: окружение живого
         // многопоточного процесса не меняем. Файла нет — пустая карта.
-        report
-            .errors
-            .extend(dotenv.errors.iter().map(|error| format!("файл .env: {error}")));
+        report.errors.extend(
+            dotenv
+                .errors
+                .iter()
+                .map(|error| format!("файл .env: {error}")),
+        );
         let provider_env = previous_env.with_dotenv(dotenv.values);
 
         let new = match Config::load_or_default(Some(path.as_path())) {
@@ -908,10 +928,7 @@ impl ConfigReloader {
                 .service_paths
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            paths.extend_missing(ServicePaths::from_config(
-                self.config_path.as_deref(),
-                &new,
-            ));
+            paths.extend_missing(ServicePaths::from_config(self.config_path.as_deref(), &new));
         }
 
         // ── [storage] runs_dir — каталог файлов-итогов ──────────────────────
@@ -1027,8 +1044,9 @@ impl ConfigReloader {
 
         // ── [skills] rag_query_url ──────────────────────────────────────────
         if new.skills != st.cfg.skills {
-            self.runtime
-                .set_skills(crate::skills::SkillsClient::new(new.skills.rag_query_url.clone()));
+            self.runtime.set_skills(crate::skills::SkillsClient::new(
+                new.skills.rag_query_url.clone(),
+            ));
             report.applied.push(format!(
                 "[skills] rag_query_url: {}",
                 new.skills
@@ -1062,14 +1080,14 @@ impl ConfigReloader {
                 .push("[server] port: применяется только перезапуском службы".to_string());
         }
         if new.server.instance != st.cfg.server.instance {
-            report.restart_required.push(
-                "[server] instance: применяется только перезапуском службы".to_string(),
-            );
+            report
+                .restart_required
+                .push("[server] instance: применяется только перезапуском службы".to_string());
         }
         if new.server.allowed_hosts != st.cfg.server.allowed_hosts {
-            report.restart_required.push(
-                "[server] allowed_hosts: применяется только перезапуском службы".to_string(),
-            );
+            report
+                .restart_required
+                .push("[server] allowed_hosts: применяется только перезапуском службы".to_string());
         }
         if new.storage.log_dir != st.cfg.storage.log_dir {
             report
@@ -1077,9 +1095,9 @@ impl ConfigReloader {
                 .push("[storage] log_dir: применяется только перезапуском службы".to_string());
         }
         if new.storage.sqlite_path != st.cfg.storage.sqlite_path {
-            report.restart_required.push(
-                "[storage] sqlite_path: применяется только перезапуском службы".to_string(),
-            );
+            report
+                .restart_required
+                .push("[storage] sqlite_path: применяется только перезапуском службы".to_string());
         }
         // Значение DSN (там пароль) не выводим никогда — только имя поля.
         if new.storage.task_store_dsn != st.cfg.storage.task_store_dsn {
@@ -1101,7 +1119,7 @@ impl ConfigReloader {
         next.storage.log_dir = st.cfg.storage.log_dir.clone();
         next.storage.sqlite_path = st.cfg.storage.sqlite_path.clone();
         next.storage.task_store_dsn = st.cfg.storage.task_store_dsn.clone();
-        next.storage.task_store_pool = st.cfg.storage.task_store_pool.clone();
+        next.storage.task_store_pool = st.cfg.storage.task_store_pool;
         if dir_changed && !dir_applied {
             next.agents.agents_dir = st.cfg.agents.agents_dir.clone();
         }
@@ -1170,8 +1188,14 @@ mod tests {
         )
         .expect(".env записан");
         let loaded = super::load_dotenv_path(&path);
-        assert_eq!(loaded.values.get("BEFORE").map(String::as_str), Some("one\ntwo"));
-        assert_eq!(loaded.values.get("AFTER").map(String::as_str), Some("three"));
+        assert_eq!(
+            loaded.values.get("BEFORE").map(String::as_str),
+            Some("one\ntwo")
+        );
+        assert_eq!(
+            loaded.values.get("AFTER").map(String::as_str),
+            Some("three")
+        );
         assert_eq!(loaded.errors.len(), 1);
         assert!(loaded.errors[0].contains("строке 3"));
         assert!(!loaded.errors[0].contains("hunter2"));
@@ -1186,7 +1210,10 @@ mod tests {
         let mut process = HashMap::new();
         process.insert(name, OsString::from("process"));
         let mut first_dotenv = HashMap::new();
-        first_dotenv.insert("AGENTS_MCP_ENV_PRIORITY_TEST".to_string(), "startup-dotenv".to_string());
+        first_dotenv.insert(
+            "AGENTS_MCP_ENV_PRIORITY_TEST".to_string(),
+            "startup-dotenv".to_string(),
+        );
         let startup = ProviderEnv {
             process,
             dotenv: first_dotenv,
@@ -1197,7 +1224,10 @@ mod tests {
         );
 
         let mut reloaded_dotenv = HashMap::new();
-        reloaded_dotenv.insert("AGENTS_MCP_ENV_PRIORITY_TEST".to_string(), "reload-dotenv".to_string());
+        reloaded_dotenv.insert(
+            "AGENTS_MCP_ENV_PRIORITY_TEST".to_string(),
+            "reload-dotenv".to_string(),
+        );
         let reloaded = startup.with_dotenv(reloaded_dotenv);
         assert_eq!(
             provider_env_var(&reloaded, "AGENTS_MCP_ENV_PRIORITY_TEST").as_deref(),
@@ -1231,12 +1261,10 @@ mod tests {
         provider_env: ProviderEnv,
     ) -> Arc<ConfigReloader> {
         let (providers, _) = build_providers(&cfg.providers, None, &provider_env).await;
-        let registry = Arc::new(
-            Registry::load(cfg.agents.agents_dir.clone()).expect("реестр для перечитки"),
-        );
-        let store: Arc<dyn crate::store::Store> = Arc::new(
-            SqliteStore::open(std::path::Path::new(":memory:")).expect("sqlite в памяти"),
-        );
+        let registry =
+            Arc::new(Registry::load(cfg.agents.agents_dir.clone()).expect("реестр для перечитки"));
+        let store: Arc<dyn crate::store::Store> =
+            Arc::new(SqliteStore::open(std::path::Path::new(":memory:")).expect("sqlite в памяти"));
         let force_override: SharedOverride =
             Arc::new(std::sync::RwLock::new(ModelOverride::default()));
         let runtime = Arc::new(Runtime::new(
@@ -1333,11 +1361,17 @@ mod tests {
         write_config(&config_path, &config_text(true));
         let report = reloader.reload().await;
         assert!(
-            !report.applied.iter().any(|line| line.contains("наблюдатель agents/ запущен")),
+            !report
+                .applied
+                .iter()
+                .any(|line| line.contains("наблюдатель agents/ запущен")),
             "неуспешный запуск не должен быть applied: {report:?}"
         );
         assert!(
-            report.errors.iter().any(|line| line.contains("наблюдатель agents/ не запущен")),
+            report
+                .errors
+                .iter()
+                .any(|line| line.contains("наблюдатель agents/ не запущен")),
             "ошибка запуска должна попасть в отчёт: {report:?}"
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -1356,7 +1390,7 @@ mod tests {
             }],
         };
 
-        let warnings = service_path_overlap_warnings(&[dir.clone()], &paths);
+        let warnings = service_path_overlap_warnings(std::slice::from_ref(&dir), &paths);
         assert_eq!(warnings.len(), 1, "ожидалось предупреждение: {warnings:?}");
         assert!(warnings[0].contains("allowed_roots"));
         assert!(warnings[0].contains("agents_dir"));
@@ -1369,7 +1403,10 @@ mod tests {
         let cwd = std::env::current_dir().expect("текущий каталог");
         for dir in cwd.ancestors() {
             assert!(
-                paths.entries.iter().any(|e| e.path == dir.join(".env") && !e.write_only),
+                paths
+                    .entries
+                    .iter()
+                    .any(|e| e.path == dir.join(".env") && !e.write_only),
                 "не защищён {}",
                 dir.join(".env").display()
             );
@@ -1411,7 +1448,10 @@ mod tests {
         let cfg_base: ProvidersConfig = toml::from_str(&base_changed).expect("конфиг разобран");
         let (set_base, ch_base) = build_providers(&cfg_base, Some(&set3), &env).await;
         assert_eq!(ch_base.changed, vec![name.to_string()]);
-        assert!(!Arc::ptr_eq(&set3.providers[name], &set_base.providers[name]));
+        assert!(!Arc::ptr_eq(
+            &set3.providers[name],
+            &set_base.providers[name]
+        ));
 
         // Изменено значение ключа — тоже changed.
         std::env::set_var(key_var, "key-2");
@@ -1442,7 +1482,9 @@ mod tests {
             ]),
         };
         assert_eq!(
-            expand_provider_proxy(&cfg.direct[name].proxy, &env_one).unwrap().as_deref(),
+            expand_provider_proxy(&cfg.direct[name].proxy, &env_one)
+                .unwrap()
+                .as_deref(),
             Some("http://one:3128")
         );
         let (first, _) = build_providers(&cfg, None, &env_one).await;
@@ -1466,7 +1508,10 @@ mod tests {
         };
         let (second, changes) = build_providers(&cfg, Some(&first), &env_two).await;
         assert_eq!(changes.changed, vec![name.to_string()]);
-        assert!(!Arc::ptr_eq(&first.providers[name], &second.providers[name]));
+        assert!(!Arc::ptr_eq(
+            &first.providers[name],
+            &second.providers[name]
+        ));
     }
 
     #[tokio::test]
@@ -1500,9 +1545,14 @@ mod tests {
         }
 
         let mut env_two = env_one;
-        env_two.dotenv.insert("PROXY_HOST".to_string(), "two".to_string());
+        env_two
+            .dotenv
+            .insert("PROXY_HOST".to_string(), "two".to_string());
         let (_, changes) = build_providers(&cfg, Some(&first), &env_two).await;
-        assert_eq!(changes.changed, vec!["anthropic".to_string(), "openrouter".to_string()]);
+        assert_eq!(
+            changes.changed,
+            vec!["anthropic".to_string(), "openrouter".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -1524,7 +1574,10 @@ mod tests {
         let cfg: ProvidersConfig = toml::from_str(&cached).expect("конфиг разобран");
         let (second, changes) = build_providers(&cfg, Some(&first), &env).await;
         assert_eq!(changes.changed, vec![name.to_string()]);
-        assert!(!Arc::ptr_eq(&first.providers[name], &second.providers[name]));
+        assert!(!Arc::ptr_eq(
+            &first.providers[name],
+            &second.providers[name]
+        ));
         std::env::remove_var(key_var);
     }
 
@@ -1542,7 +1595,10 @@ mod tests {
         let (set, _) = build_providers(&cfg, None, &env).await;
         assert!(set.providers.contains_key("claude-cli"));
         assert_eq!(set.statuses["claude-cli"].status, "down");
-        assert!(set.statuses["claude-cli"].message.as_deref().is_some_and(|m| !m.is_empty()));
+        assert!(set.statuses["claude-cli"]
+            .message
+            .as_deref()
+            .is_some_and(|m| !m.is_empty()));
 
         let (reused, changes) = build_providers(&cfg, Some(&set), &env).await;
         assert!(changes.is_empty());
@@ -1553,11 +1609,9 @@ mod tests {
     #[tokio::test]
     async fn successful_cli_doctor_is_saved_as_ok() {
         let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-        let cfg: ProvidersConfig = toml::from_str(&format!(
-            "[claude_cli]\nexecutable = '{}'\n",
-            rustc
-        ))
-        .expect("конфиг claude-cli");
+        let cfg: ProvidersConfig =
+            toml::from_str(&format!("[claude_cli]\nexecutable = '{}'\n", rustc))
+                .expect("конфиг claude-cli");
 
         let env = ProviderEnv::capture(HashMap::new());
         let (set, _) = build_providers(&cfg, None, &env).await;

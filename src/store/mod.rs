@@ -326,7 +326,8 @@ pub trait Store: Send + Sync {
     ) -> Result<i64>;
 
     /// Прочитать артефакты задачи; опционально только указанных `kind`.
-    async fn read_artifacts(&self, task_id: i64, kinds: Option<&[String]>) -> Result<Vec<Artifact>>;
+    async fn read_artifacts(&self, task_id: i64, kinds: Option<&[String]>)
+        -> Result<Vec<Artifact>>;
 
     /// Добавить событие в журнал задачи (seq = max+1).
     async fn append_task_event(
@@ -551,9 +552,12 @@ mod tests {
 
     #[test]
     fn backend_unknown_scheme_errors_without_secrets() {
-        let err = parse_backend(Some("mysql://user:secret@db-host/agents"), &def_sqlite_path())
-            .expect_err("схема не поддерживается")
-            .to_string();
+        let err = parse_backend(
+            Some("mysql://user:secret@db-host/agents"),
+            &def_sqlite_path(),
+        )
+        .expect_err("схема не поддерживается")
+        .to_string();
         assert!(err.contains("mysql://"), "в ошибке нужна схема: {err}");
         assert!(
             !err.contains("secret"),

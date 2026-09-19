@@ -81,7 +81,9 @@ impl LogWriterHandle {
             Ok(Ok(true)) => {}
             Ok(Ok(false)) => {
                 eprintln!("event-writer: финальный flush завершился ошибкой");
-                let _ = tokio::time::timeout(timeout.saturating_sub(started.elapsed()), &mut self.task).await;
+                let _ =
+                    tokio::time::timeout(timeout.saturating_sub(started.elapsed()), &mut self.task)
+                        .await;
                 return false;
             }
             Ok(Err(_)) => {
@@ -96,7 +98,10 @@ impl LogWriterHandle {
             }
         }
         let remaining = timeout.saturating_sub(started.elapsed());
-        if !matches!(tokio::time::timeout(remaining, &mut self.task).await, Ok(Ok(()))) {
+        if !matches!(
+            tokio::time::timeout(remaining, &mut self.task).await,
+            Ok(Ok(()))
+        ) {
             eprintln!("event-writer: задача не завершилась после финального flush");
             self.task.abort();
             return false;
@@ -284,8 +289,8 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_flushes_last_event_to_sqlite() {
-        let dir = std::env::temp_dir()
-            .join(format!("agents-mcp-log-shutdown-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-log-shutdown-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("logs.db");
         let store: Arc<dyn Store> = Arc::new(crate::store::SqliteStore::open(&db_path).unwrap());

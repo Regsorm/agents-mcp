@@ -21,17 +21,30 @@ use crate::store::Store;
 /// Тип определён в хранилище — кеш и есть его таблица.
 pub use crate::store::CachedEntry;
 
-pub fn compute_key(
-    agent_name: &str,
-    variant: &str,
-    provider_name: &str,
-    model_name: &str,
-    prompt: &str,
-    task_context: &str,
-    input: &Map<String, Value>,
-    key_fields: &[String],
-    task_id: Option<i64>,
-) -> String {
+pub struct CacheKeyParts<'a> {
+    pub agent_name: &'a str,
+    pub variant: &'a str,
+    pub provider_name: &'a str,
+    pub model_name: &'a str,
+    pub prompt: &'a str,
+    pub task_context: &'a str,
+    pub input: &'a Map<String, Value>,
+    pub key_fields: &'a [String],
+    pub task_id: Option<i64>,
+}
+
+pub fn compute_key(parts: CacheKeyParts<'_>) -> String {
+    let CacheKeyParts {
+        agent_name,
+        variant,
+        provider_name,
+        model_name,
+        prompt,
+        task_context,
+        input,
+        key_fields,
+        task_id,
+    } = parts;
     // Сортированное подмножество для детерминированности.
     let subset: BTreeMap<&str, &Value> = if key_fields.is_empty() {
         input.iter().map(|(k, v)| (k.as_str(), v)).collect()
@@ -95,17 +108,17 @@ mod tests {
         key_fields: &[String],
         task_id: Option<i64>,
     ) -> String {
-        compute_key(
-            agent,
+        compute_key(CacheKeyParts {
+            agent_name: agent,
             variant,
-            "provider",
-            "model",
-            "prompt",
-            "task context",
+            provider_name: "provider",
+            model_name: "model",
+            prompt: "prompt",
+            task_context: "task context",
             input,
             key_fields,
             task_id,
-        )
+        })
     }
 
     #[test]
@@ -196,22 +209,25 @@ mod tests {
     #[test]
     fn execution_identity_affects_key() {
         let input = obj(json!({"brief": "x"}));
-        let base = compute_key(
-            "agent", "default", "provider", "model", "prompt", "context", &input, &[], None,
-        );
+        let key_for = |provider_name, model_name, prompt, task_context| {
+            compute_key(CacheKeyParts {
+                agent_name: "agent",
+                variant: "default",
+                provider_name,
+                model_name,
+                prompt,
+                task_context,
+                input: &input,
+                key_fields: &[],
+                task_id: None,
+            })
+        };
+        let base = key_for("provider", "model", "prompt", "context");
         for changed in [
-            compute_key(
-                "agent", "default", "other", "model", "prompt", "context", &input, &[], None,
-            ),
-            compute_key(
-                "agent", "default", "provider", "other", "prompt", "context", &input, &[], None,
-            ),
-            compute_key(
-                "agent", "default", "provider", "model", "other", "context", &input, &[], None,
-            ),
-            compute_key(
-                "agent", "default", "provider", "model", "prompt", "other", &input, &[], None,
-            ),
+            key_for("other", "model", "prompt", "context"),
+            key_for("provider", "other", "prompt", "context"),
+            key_for("provider", "model", "other", "context"),
+            key_for("provider", "model", "prompt", "other"),
         ] {
             assert_ne!(base, changed);
         }
@@ -224,8 +240,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn cache_pg_round_trip() {
-        let dsn =
-            std::env::var("AGENTS_MCP_TEST_PG_DSN").expect("AGENTS_MCP_TEST_PG_DSN не задан");
+        let dsn = std::env::var("AGENTS_MCP_TEST_PG_DSN").expect("AGENTS_MCP_TEST_PG_DSN не задан");
         let st = crate::store::PgStore::connect(&dsn, 2).expect("connect");
         let key = format!(
             "test-{}",
@@ -236,9 +251,15 @@ mod tests {
         assert!(lookup(&st, key.clone()).await.unwrap().is_none());
 
         // Записали — нашли.
-        store(&st, key.clone(), "{\"r\":1}".into(), "{\"m\":2}".into(), 3600)
-            .await
-            .unwrap();
+        store(
+            &st,
+            key.clone(),
+            "{\"r\":1}".into(),
+            "{\"m\":2}".into(),
+            3600,
+        )
+        .await
+        .unwrap();
         let entry = lookup(&st, key.clone())
             .await
             .unwrap()
