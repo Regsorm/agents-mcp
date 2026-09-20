@@ -168,6 +168,9 @@ struct ReadyCall {
     deadline: tokio::time::Instant,
     timeout_sec: u64,
     call_key_guard: CallKeyGuard,
+    /// Снимок `[storage] runs_dir` на момент подготовки: туда кладётся сырой
+    /// ответ модели, если разобрать его как JSON не удалось.
+    runs_dir: PathBuf,
 }
 
 /// Строка истории вызовов (`agent_calls`). Тип живёт в хранилище: рантайм
@@ -2046,6 +2049,11 @@ impl Runtime {
             deadline,
             timeout_sec,
             call_key_guard,
+            runs_dir: self
+                .runs_dir
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         })))
     }
 }
@@ -2251,6 +2259,7 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
         deadline: _,
         timeout_sec: _,
         call_key_guard: _call_key_guard,
+        runs_dir,
     } = ready;
 
     let llm_resp = match provider.complete(llm_req).await {
@@ -2338,8 +2347,9 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
         }
     };
 
-    // Парсинг ответа: для format=json пытаемся serde_json, при фейле снимаем
-    // Markdown codefences и пробуем ещё раз. Без retry к провайдеру.
+    // Парсинг ответа: для format=json перебираем кандидатов (ответ как есть →
+    // тело обрамления → кусок по скобкам) с проверкой разбором. Без retry к
+    // провайдеру.
     // Разбор не удался — ответ негоден: у format=json вызывающий ждёт объект, а
     // получает строку и падает сам. Такой ответ нельзя класть в кеш (см. ниже).
     let mut incomplete_reasons = Vec::new();
@@ -2354,23 +2364,23 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
     }
     let result_value: Value = match agent.config.response.format {
         ResponseFormat::Text => Value::String(llm_resp.content.clone()),
-        ResponseFormat::Json => match serde_json::from_str::<Value>(&llm_resp.content) {
+        ResponseFormat::Json => match parse_json_tolerant(&llm_resp.content) {
             Ok(v) => v,
-            Err(_) => {
-                let stripped = strip_json_fences(&llm_resp.content);
-                match serde_json::from_str::<Value>(stripped) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(
-                            agent = %agent_name,
-                            error = %e,
-                            "ответ модели не валидный JSON даже после снятия fences, возвращаю как text"
-                        );
-                        incomplete_reasons
-                            .push("ответ format=json не удалось разобрать как JSON".to_string());
-                        Value::String(llm_resp.content.clone())
-                    }
-                }
+            Err(e) => {
+                warn!(
+                    agent = %agent_name,
+                    error = %e,
+                    "ответ модели не валидный JSON ни одним из кандидатов, возвращаю как text"
+                );
+                let saved = write_raw_response(&runs_dir, call_id, &agent_name, &llm_resp.content);
+                incomplete_reasons.push(match saved {
+                    Some(path) => format!(
+                        "ответ format=json не удалось разобрать как JSON (сырой ответ: {})",
+                        path.display()
+                    ),
+                    None => "ответ format=json не удалось разобрать как JSON".to_string(),
+                });
+                Value::String(llm_resp.content.clone())
             }
         },
     };
@@ -2580,7 +2590,15 @@ fn cleanup_result_files_before(runs_dir: &Path, cutoff: SystemTime) -> u64 {
             }
         };
         let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        // Кроме самих итогов чистим `-raw.txt` — сырые ответы, сохранённые при
+        // неудачном разборе JSON: живут столько же, сколько итоги, иначе
+        // каталог растёт без меры. Посторонние файлы не трогаем.
+        let is_result = path.extension().and_then(|ext| ext.to_str()) == Some("json");
+        let is_raw_answer = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-raw.txt"));
+        if !is_result && !is_raw_answer {
             continue;
         }
         let modified = match entry.metadata().and_then(|meta| meta.modified()) {
@@ -2814,34 +2832,76 @@ async fn read_call_outcome(
     }
 }
 
-/// Достать JSON из ответа модели.
+/// Разобрать ответ модели как JSON, перебирая кандидатов с проверкой разбором.
 ///
-/// Обрамление ```json ... ``` снимается, даже когда перед ним стоит пояснение:
-/// модели пишут фразу вроде «Проверил три места» и только потом JSON. Раньше
-/// рамка снималась лишь с начала ответа, и готовая работа отвергалась из-за
-/// одной лишней строки текста (случай повторялся у DeepSeek Flash и у Opus).
-/// Поддерживаются пометки языка json и javascript, а также рамка без пометки.
-/// Если рамки нет — берётся кусок от первой открывающей скобки до последней
-/// закрывающей. Ничего похожего на JSON не нашлось — возвращается сам ответ.
-fn strip_json_fences(s: &str) -> &str {
+/// Порядок: ответ как есть → тело обрамления ```` ```json ... ``` ```` → кусок
+/// от первой открывающей скобки до последней закрывающей. Побеждает первый
+/// кандидат, который разобрался; ни один не подошёл — ошибка разбора самого
+/// ответа. Проверка разбором обязательна: одну стратегию вслепую сбивал план,
+/// у которого внутри строкового поля лежали собственные блоки кода.
+fn parse_json_tolerant(s: &str) -> Result<Value, serde_json::Error> {
     let trimmed = s.trim();
-    if let Some(open) = trimmed.find("```") {
-        let after_tag = &trimmed[open + 3..];
-        let body = after_tag
-            .strip_prefix("json")
-            .or_else(|| after_tag.strip_prefix("javascript"))
-            .unwrap_or(after_tag)
-            .trim_start();
-        let inner = match body.find("```") {
-            Some(close) => body[..close].trim(),
-            // Рамку открыли и не закрыли — берём всё, что после открытия.
-            None => body.trim_end(),
-        };
-        if !inner.is_empty() {
-            return inner;
+    let as_is = serde_json::from_str::<Value>(trimmed);
+    if as_is.is_ok() {
+        return as_is;
+    }
+    for candidate in [fence_body(trimmed), json_span(trimmed)]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(v) = serde_json::from_str::<Value>(candidate) {
+            return Ok(v);
         }
     }
-    json_span(trimmed).unwrap_or(trimmed)
+    as_is
+}
+
+/// Тело обрамления: от первого открывающего ```` ``` ```` до ПОСЛЕДНЕГО
+/// закрывающего.
+///
+/// Обрамление снимается, даже когда перед ним стоит пояснение: модели пишут
+/// фразу вроде «Проверил три места» и только потом JSON. Поддерживаются пометки
+/// языка json и javascript, а также рамка без пометки. Закрывающее ищется
+/// последним, потому что внутри строковых полей JSON бывают свои блоки кода —
+/// по первому вхождению ответ обрезался на чужой рамке.
+fn fence_body(s: &str) -> Option<&str> {
+    let open = s.find("```")?;
+    let after_tag = &s[open + 3..];
+    let body = after_tag
+        .strip_prefix("json")
+        .or_else(|| after_tag.strip_prefix("javascript"))
+        .unwrap_or(after_tag)
+        .trim_start();
+    let inner = match body.rfind("```") {
+        Some(close) => body[..close].trim(),
+        // Рамку открыли и не закрыли — берём всё, что после открытия.
+        None => body.trim_end(),
+    };
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+/// Сохранить сырой ответ модели рядом с файлом-итогом вызова, когда разобрать
+/// его как JSON не удалось ни одним кандидатом. Без этого причина отказа
+/// доставалась только ручным чтением поля `result` из строки вызова.
+fn write_raw_response(
+    runs_dir: &Path,
+    call_id: i64,
+    agent: &str,
+    content: &str,
+) -> Option<PathBuf> {
+    let path = runs_dir.join(format!("{call_id}-{agent}-raw.txt"));
+    match std::fs::create_dir_all(runs_dir).and_then(|()| std::fs::write(&path, content)) {
+        Ok(()) => Some(path),
+        Err(e) => {
+            warn!(call_id, path = %path.display(), error = %e,
+                  "не удалось сохранить сырой ответ модели");
+            None
+        }
+    }
 }
 
 /// Кусок от первой открывающей скобки до последней закрывающей.
@@ -3276,49 +3336,81 @@ mod tests {
 
     // ── Чистые функции ──────────────────────────────────────────────────
 
-    #[test]
-    fn strip_fences_json_block() {
-        assert_eq!(strip_json_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
+    /// План с двумя блоками кода внутри строкового поля — тот самый ответ, на
+    /// котором разбор по первому закрывающему обрамлению терял 9/10 текста.
+    fn plan_with_two_code_blocks() -> String {
+        let plan = "Шаг 1.\n```rust\nfn a() {}\n```\nШаг 2.\n```rust\nfn b() {}\n```\nГотово.";
+        serde_json::json!({"plan": plan, "questions": [], "used_transcript": false}).to_string()
     }
 
     #[test]
-    fn strip_fences_plain_block() {
-        assert_eq!(strip_json_fences("```\n{\"a\":1}\n```"), "{\"a\":1}");
+    fn parse_json_fenced_answer_with_inner_code_blocks() {
+        let body = plan_with_two_code_blocks();
+        let answer = format!("```json\n{body}\n```");
+        let v = parse_json_tolerant(&answer).expect("ответ обязан разобраться целиком");
+        assert!(v["plan"]
+            .as_str()
+            .expect("plan — строка")
+            .contains("fn b()"));
     }
 
     #[test]
-    fn strip_fences_no_fence_just_trims() {
-        assert_eq!(strip_json_fences("  {\"a\":1}  "), "{\"a\":1}");
+    fn parse_json_fenced_without_language_tag() {
+        let body = plan_with_two_code_blocks();
+        let answer = format!("```\n{body}\n```");
+        let v = parse_json_tolerant(&answer).expect("рамка без пометки языка тоже снимается");
+        assert!(v["plan"]
+            .as_str()
+            .expect("plan — строка")
+            .contains("fn b()"));
     }
 
     #[test]
-    fn strip_fences_open_without_close() {
-        // Открыли fence, но не закрыли — возвращаем что после открытия.
-        assert_eq!(strip_json_fences("```json\n{\"a\":1}"), "{\"a\":1}");
-    }
-
-    #[test]
-    fn strip_fences_after_leading_text() {
+    fn parse_json_after_leading_text() {
         // Модель пояснила ответ словами и только потом дала рамку с JSON.
-        assert_eq!(
-            strip_json_fences("Проверил три места.\n\n```json\n{\"a\":1}\n```"),
-            "{\"a\":1}"
-        );
+        let v = parse_json_tolerant("Проверил три места.\n\n```json\n{\"a\":1}\n```")
+            .expect("пояснение перед рамкой не мешает");
+        assert_eq!(v["a"], 1);
     }
 
     #[test]
-    fn strip_fences_json_without_fence_but_with_text() {
+    fn parse_json_without_fence() {
+        let v = parse_json_tolerant("  {\"a\":1}  ").expect("ответ без рамки разбирается как есть");
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn parse_json_without_fence_but_with_text() {
         // Рамки нет, текст вокруг есть — берём кусок по скобкам.
-        assert_eq!(
-            strip_json_fences("Вот итог: {\"a\":1} — готово."),
-            "{\"a\":1}"
-        );
+        let v = parse_json_tolerant("Вот итог: {\"a\":1} — готово.").expect("кусок по скобкам");
+        assert_eq!(v["a"], 1);
     }
 
     #[test]
-    fn strip_fences_text_without_json_returns_text() {
-        // Ничего похожего на JSON — ответ возвращается как есть.
-        assert_eq!(strip_json_fences("  просто текст  "), "просто текст");
+    fn parse_json_open_fence_without_close() {
+        let v = parse_json_tolerant("```json\n{\"a\":1}").expect("незакрытая рамка не мешает");
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn parse_json_broken_json_is_refused() {
+        // Скобка не закрыта — честный отказ, а не обрывок.
+        assert!(parse_json_tolerant("```json\n{\"a\": 1\n```").is_err());
+        assert!(parse_json_tolerant("  просто текст  ").is_err());
+    }
+
+    #[test]
+    fn write_raw_response_saves_answer_as_is() {
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-raw-answer-{}", uuid::Uuid::new_v4()));
+        let content = "```json\n{\"a\": 1\n```";
+        let path =
+            write_raw_response(&dir, 42, "code-planner", content).expect("сырой ответ сохранён");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("файл читается"),
+            content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4584,24 +4676,29 @@ mod tests {
         let stale = dir.join("stale.json");
         let fresh = dir.join("fresh.json");
         let other = dir.join("keep.txt");
+        let stale_raw = dir.join("7-planner-raw.txt");
         std::fs::write(&stale, "старый").expect("старый итог");
         std::fs::write(&fresh, "свежий").expect("свежий итог");
         std::fs::write(&other, "не итог").expect("посторонний файл");
+        std::fs::write(&stale_raw, "сырой ответ").expect("старый сырой ответ");
         // Граница — час назад, старому файлу время ставим явно на два часа
         // назад: время изменения файла на Windows грубее SystemTime::now(),
         // и граница «сейчас» между двумя записями давала плавающий итог.
         let now = SystemTime::now();
-        std::fs::File::options()
-            .write(true)
-            .open(&stale)
-            .and_then(|f| f.set_modified(now - Duration::from_secs(2 * 3600)))
-            .expect("время старого итога");
+        for path in [&stale, &stale_raw] {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .and_then(|f| f.set_modified(now - Duration::from_secs(2 * 3600)))
+                .expect("время старого файла");
+        }
         let cutoff = now - Duration::from_secs(3600);
 
-        assert_eq!(cleanup_result_files_before(&dir, cutoff), 1);
+        assert_eq!(cleanup_result_files_before(&dir, cutoff), 2);
         assert!(!stale.exists());
+        assert!(!stale_raw.exists(), "старый сырой ответ тоже убирается");
         assert!(fresh.exists());
-        assert!(other.exists());
+        assert!(other.exists(), "посторонний .txt не трогаем");
 
         let _ = std::fs::remove_dir_all(dir);
     }
