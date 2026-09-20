@@ -2385,7 +2385,8 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
         },
     };
 
-    // Лёгкая валидация против schema_file — не блокирует, только warn.
+    // Лёгкая валидация против schema_file — warn всегда; при schema_strict
+    // несоответствие ещё и делает вызов неполным.
     if matches!(agent.config.response.format, ResponseFormat::Json) {
         if let Some(schema) = &agent.schema {
             if let Err(e) = validate_against_schema(&result_value, schema) {
@@ -2394,6 +2395,18 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
                     error = %e,
                     "ответ не соответствует schema_file"
                 );
+                if agent.config.response.schema_strict {
+                    let saved =
+                        write_raw_response(&runs_dir, call_id, &agent_name, &llm_resp.content);
+                    incomplete_reasons.push(match saved {
+                        Some(path) => format!(
+                            "ответ не соответствует schema_file: {} (сырой ответ: {})",
+                            e,
+                            path.display()
+                        ),
+                        None => format!("ответ не соответствует schema_file: {e}"),
+                    });
+                }
             }
         }
     }
@@ -4225,6 +4238,114 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.status, "incomplete");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Рантайм с агентом format=json: есть schema.json, требующая поле
+    /// `summary`, и переключатель `schema_strict`. Модель (FixedProvider)
+    /// возвращает объект без этого поля — сырой ответ равен prompt.md.
+    fn schema_runtime(strict: bool) -> (Runtime, Arc<crate::store::SqliteStore>, PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("agents-mcp-schema-strict-{}", uuid::Uuid::new_v4()));
+        let agent_dir = dir.join("agents/test");
+        std::fs::create_dir_all(&agent_dir).expect("каталог агента");
+        std::fs::write(
+            agent_dir.join("config.toml"),
+            format!(
+                "name = \"test\"\n\n[model]\nprovider = \"fixed\"\nname = \"fixed-model\"\n\n[response]\nformat = \"json\"\nschema_file = \"schema.json\"\nschema_strict = {strict}\n"
+            ),
+        )
+        .expect("config.toml агента");
+        std::fs::write(
+            agent_dir.join("schema.json"),
+            r#"{"type":"object","required":["summary"],"properties":{"summary":{"type":"string"}}}"#,
+        )
+        .expect("schema.json агента");
+        std::fs::write(agent_dir.join("prompt.md"), r#"{"verdict":"ok"}"#)
+            .expect("prompt.md агента");
+
+        let store = Arc::new(
+            crate::store::SqliteStore::open(Path::new(":memory:")).expect("хранилище журнала"),
+        );
+        let registry = Arc::new(Registry::load(dir.join("agents")).expect("реестр агентов"));
+        let providers = HashMap::from([(
+            "fixed".to_string(),
+            Arc::new(FixedProvider {
+                finish_reason: "stop",
+                panic: false,
+            }) as Arc<dyn LlmProvider>,
+        )]);
+        let runtime = Runtime::new(
+            store.clone(),
+            registry,
+            providers,
+            crate::skills::SkillsClient::new(None),
+            Arc::new(std::sync::RwLock::new(ModelOverride::default())),
+            dir.join("runs"),
+            "test:status".into(),
+            120,
+        );
+        (runtime, store, dir)
+    }
+
+    /// Файлы сырого ответа (`-raw.txt`) в каталоге прогонов вызова.
+    fn raw_response_files(runs_dir: &Path) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(runs_dir) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with("-raw.txt"))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn strict_schema_mismatch_makes_call_incomplete_and_saves_raw() {
+        let (runtime, store, dir) = schema_runtime(true);
+        let outcome = runtime.invoke(cache_req()).await.expect("вызов выполнен");
+        let (response, error) = match outcome {
+            InvokeOutcome::Incomplete { response, error } => (response, error),
+            _ => panic!("ожидался incomplete"),
+        };
+        assert!(
+            error.contains("ответ не соответствует schema_file"),
+            "error={error}"
+        );
+        assert!(
+            error.contains("summary"),
+            "в причине нет имени недостающего поля: {error}"
+        );
+        let row = store
+            .get_call_row(response.metadata.call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "incomplete");
+        let raw = raw_response_files(&dir.join("runs"));
+        assert_eq!(raw.len(), 1, "ожидался файл -raw.txt: {raw:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn soft_schema_mismatch_keeps_call_done_without_raw_file() {
+        let (runtime, store, dir) = schema_runtime(false);
+        let outcome = runtime.invoke(cache_req()).await.expect("вызов выполнен");
+        let response = sync_response(outcome);
+        let row = store
+            .get_call_row(response.metadata.call_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, "done");
+        assert!(
+            raw_response_files(&dir.join("runs")).is_empty(),
+            "при выключенном переключателе сырой ответ не сохраняется"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

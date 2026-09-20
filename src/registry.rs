@@ -165,6 +165,11 @@ pub struct ResponseConfig {
     pub format: ResponseFormat,
     #[serde(default)]
     pub schema_file: Option<String>,
+    /// Жёсткая проверка ответа против `schema_file`: несоответствие делает
+    /// вызов неполным (`incomplete`) и сохраняет сырой ответ рядом с итогом,
+    /// а не только пишет предупреждение в журнал.
+    #[serde(default)]
+    pub schema_strict: bool,
 }
 
 impl Default for ResponseConfig {
@@ -172,6 +177,7 @@ impl Default for ResponseConfig {
         Self {
             format: ResponseFormat::Text,
             schema_file: None,
+            schema_strict: false,
         }
     }
 }
@@ -544,7 +550,7 @@ fn unknown_agent_config_keys(raw: &str) -> Result<Vec<String>, toml::de::Error> 
                 "extra_body",
             ][..],
         ),
-        ("response", &["format", "schema_file"]),
+        ("response", &["format", "schema_file", "schema_strict"]),
         ("input", &["required", "optional"]),
         (
             "limits",
@@ -824,6 +830,51 @@ mod tests {
             assert_eq!(секция.allowed_tools, vec!["t1".to_string()], "имя {имя}");
             assert_eq!(секция.max_turns, Some(7), "имя {имя}");
         }
+    }
+
+    #[test]
+    fn schema_strict_defaults_to_off() {
+        let текст = "name = \"a\"\n[model]\nprovider = \"mock\"\nname = \"m\"\n[response]\nformat = \"json\"\nschema_file = \"schema.json\"\n";
+        let config: AgentConfig = toml::from_str(текст).expect("конфиг разобран");
+        assert!(
+            !config.response.schema_strict,
+            "по умолчанию проверка мягкая"
+        );
+    }
+
+    #[test]
+    fn schema_strict_key_is_known_and_parsed() {
+        // Ключ добавлен в список разрешённых: иначе конфиг агента с ним был бы
+        // отвергнут как содержащий неизвестный ключ.
+        let текст = "name = \"a\"\n[model]\nprovider = \"mock\"\nname = \"m\"\n[response]\nformat = \"json\"\nschema_file = \"schema.json\"\nschema_strict = true\n";
+        let config: AgentConfig = toml::from_str(текст).expect("конфиг разобран");
+        assert!(config.response.schema_strict, "schema_strict прочитан");
+        assert!(
+            unknown_agent_config_keys(текст).unwrap().is_empty(),
+            "schema_strict не должен попадать в неизвестные ключи"
+        );
+    }
+
+    #[test]
+    fn agent_config_with_schema_strict_loads() {
+        // Ключ не отвергает агента при загрузке и действительно читается.
+        let base = temp_dir("schema-strict-load");
+        let agent_dir = base.join("strict-agent");
+        std::fs::create_dir_all(&agent_dir).expect("каталог агента");
+        std::fs::write(
+            agent_dir.join("config.toml"),
+            "name = \"strict-agent\"\n[model]\nprovider = \"mock\"\nname = \"m\"\n[response]\nformat = \"json\"\nschema_file = \"schema.json\"\nschema_strict = true\n",
+        )
+        .expect("config.toml агента");
+        std::fs::write(agent_dir.join("prompt.md"), "ответ").expect("prompt.md агента");
+        std::fs::write(
+            agent_dir.join("schema.json"),
+            r#"{"type":"object","required":["summary"]}"#,
+        )
+        .expect("schema.json агента");
+        let def = load_agent(&agent_dir).expect("агент с schema_strict загружен");
+        assert!(def.config.response.schema_strict);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
