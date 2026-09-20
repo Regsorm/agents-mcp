@@ -39,7 +39,7 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
 
@@ -98,7 +98,7 @@ jobs:
       # Тег нужен локально: описание нового выпуска берётся из его аннотации.
       # Этот шаг идёт первым — checkout чистит рабочий каталог и снёс бы
       # уже скачанные архивы.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ env.TAG }}
           fetch-depth: 0
