@@ -80,6 +80,8 @@ pub struct ProvidersConfig {
     pub claude_cli: Option<ClaudeCliConfig>,
     #[serde(default)]
     pub codex_cli: Option<CodexCliConfig>,
+    #[serde(default)]
+    pub grok_cli: Option<GrokCliConfig>,
     /// Пул «прямых» HTTP-подключений. Ключ map = имя провайдера, под которым
     /// агент его выбирает (`provider = "mimo"`). Подключения различаются
     /// `base_url` и `api_key_env`, а вид API задаётся полем `api`: OpenAI-
@@ -239,6 +241,58 @@ pub struct CodexCliConfig {
 
 fn default_codex_executable() -> String {
     "codex".into()
+}
+
+/// Конфиг провайдера grok-cli (subprocess через `grok.exe`, Grok CLI).
+///
+/// Авторизация — вход в Grok CLI на этой машине (подписка): API-ключ не нужен,
+/// поштучной стоимости вызова нет. При старте службы делается doctor self-test
+/// (`grok --version`); если CLI не найден, провайдер регистрируется со статусом
+/// "down", а вызов вернёт ошибку запуска subprocess.
+///
+/// Полей proxy/proxy_bypass здесь нет: посредник до сервиса Grok этой сборке не
+/// нужен (сеть проверена живыми прогонами 21.09.2026).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct GrokCliConfig {
+    /// Путь к бинарнику grok. По умолчанию — "grok" (берётся из PATH).
+    #[serde(default = "default_grok_executable")]
+    pub executable: String,
+
+    /// Максимум параллельных subprocess-вызовов grok. Каждый вызов — отдельный
+    /// процесс CLI и своя подписка на квоту, поэтому выше двух не поднимаем.
+    #[serde(default = "default_cli_max_concurrent")]
+    pub max_concurrent: u32,
+
+    /// Путь к пользовательскому `config.toml` CLI. Из него провайдер читает
+    /// имена ЛИЧНЫХ MCP-серверов (подписки Claude/Cursor, локальные) и гасит их
+    /// в сгенерированном на вызов конфиге — иначе чужой сервер подтянулся бы в
+    /// вызов агента. None — берётся `<USERPROFILE|HOME>/.grok/config.toml`.
+    /// Явный путь с `~` не разворачивается: крейта `dirs` в проекте нет.
+    #[serde(default)]
+    pub user_config: Option<String>,
+
+    /// Дефолтное значение `--max-turns` если агент не задал своё. Защита от
+    /// бесконечных tool-loop'ов; 40 — как у агента code-implementer-grok.
+    #[serde(default = "default_grok_max_turns")]
+    pub default_max_turns: u32,
+
+    /// Предел времени одного вызова MCP-инструмента в сгенерированном конфиге
+    /// CLI (`tool_timeout_sec`). 120 — тот же порядок, что `RPC_TIMEOUT` в
+    /// `providers/mcp_client.rs`.
+    #[serde(default = "default_grok_tool_timeout_sec")]
+    pub tool_timeout_sec: u64,
+}
+
+fn default_grok_executable() -> String {
+    "grok".into()
+}
+
+fn default_grok_max_turns() -> u32 {
+    40
+}
+
+fn default_grok_tool_timeout_sec() -> u64 {
+    120
 }
 
 fn default_max_turns() -> u32 {
@@ -487,6 +541,7 @@ fn unknown_main_config_keys(raw: &str) -> std::result::Result<Vec<String>, toml:
                 "anthropic",
                 "claude_cli",
                 "codex_cli",
+                "grok_cli",
                 "direct",
             ],
         ),
@@ -555,6 +610,20 @@ fn unknown_main_config_keys(raw: &str) -> std::result::Result<Vec<String>, toml:
                     "max_concurrent",
                     "proxy",
                     "proxy_bypass",
+                ],
+                &mut out,
+            );
+        }
+        if let Some(table) = providers.get("grok_cli").and_then(toml::Value::as_table) {
+            unknown_keys_in_table(
+                table,
+                "providers.grok_cli.",
+                &[
+                    "executable",
+                    "max_concurrent",
+                    "user_config",
+                    "default_max_turns",
+                    "tool_timeout_sec",
                 ],
                 &mut out,
             );

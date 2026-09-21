@@ -29,6 +29,7 @@ use crate::providers::{
     anthropic::{AnthropicOptions, AnthropicProvider},
     claude_cli::ClaudeCliProvider,
     codex_cli::CodexCliProvider,
+    grok_cli::GrokCliProvider,
     mock::MockProvider,
     openrouter::{OpenRouterOptions, OpenRouterProvider},
     LlmProvider,
@@ -370,7 +371,7 @@ pub async fn build_providers(
     for (name, entry) in &cfg.direct {
         if matches!(
             name.as_str(),
-            "mock" | "openrouter" | "anthropic" | "claude-cli" | "codex-cli"
+            "mock" | "openrouter" | "anthropic" | "claude-cli" | "codex-cli" | "grok-cli"
         ) {
             tracing::warn!(
                 provider = %name,
@@ -531,6 +532,49 @@ pub async fn build_providers(
             }
         }
         fingerprints.insert("codex-cli".into(), fp);
+    }
+
+    if let Some(grok_cfg) = &cfg.grok_cli {
+        let fp = fingerprint_section(&format!("{:?}", grok_cfg));
+        match reuse_prev(prev, "grok-cli", &fp) {
+            Some(provider) => {
+                providers.insert("grok-cli".into(), provider);
+                statuses.insert(
+                    "grok-cli".into(),
+                    reuse_status(prev, "grok-cli").unwrap_or_else(ProviderStatus::registered),
+                );
+            }
+            None => {
+                let exe_path = std::path::PathBuf::from(&grok_cfg.executable);
+                // Doctor self-test: вызов `grok --version`. Если CLI недоступен —
+                // регистрируем провайдер всё равно, но в логе warn (агенты упадут
+                // на complete() с понятной ошибкой). Так health видно сразу.
+                let status = match GrokCliProvider::doctor(&exe_path).await {
+                    Ok(version) => {
+                        info!(executable = %grok_cfg.executable, %version, "провайдер grok-cli подключён");
+                        ProviderStatus::ok()
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            executable = %grok_cfg.executable,
+                            error = %e,
+                            "doctor self-test grok --version упал — провайдер всё равно регистрируется, но invoke упадёт"
+                        );
+                        ProviderStatus::down(e)
+                    }
+                };
+                let provider = GrokCliProvider::new(
+                    exe_path,
+                    grok_cfg.user_config.clone().map(std::path::PathBuf::from),
+                    grok_cfg.max_concurrent,
+                    grok_cfg.default_max_turns,
+                    grok_cfg.tool_timeout_sec,
+                );
+                providers.insert("grok-cli".into(), Arc::new(provider));
+                statuses.insert("grok-cli".into(), status);
+            }
+        }
+        fingerprints.insert("grok-cli".into(), fp);
     }
 
     let changes = provider_changes(prev, &fingerprints);

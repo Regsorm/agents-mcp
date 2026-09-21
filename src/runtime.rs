@@ -2250,7 +2250,10 @@ impl Runtime {
                 // передать некуда — отказ (строка вызова уже зарезервирована).
                 if !overrides.mcp_urls.is_empty()
                     || (overrides.effort.is_some()
-                        && matches!(provider_name.as_str(), "claude-cli" | "codex-cli"))
+                        && matches!(
+                            provider_name.as_str(),
+                            "claude-cli" | "codex-cli" | "grok-cli"
+                        ))
                 {
                     let err = InvokeError::Overrides(
                         "у агента нет секции [execution]: перекрытие effort / mcp.*.url \

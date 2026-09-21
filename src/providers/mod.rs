@@ -7,6 +7,7 @@
 pub mod anthropic;
 pub mod claude_cli;
 pub mod codex_cli;
+pub mod grok_cli;
 pub mod mcp_client;
 pub mod mock;
 pub mod openrouter;

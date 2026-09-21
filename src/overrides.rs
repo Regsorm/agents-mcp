@@ -156,6 +156,22 @@ pub fn url_allowed(url: &str, allowed: &[String]) -> bool {
     path == "mcp" && !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
+/// Записать в аргументы CLI пару «флаг + значение»: уже стоящая пара заменяется
+/// на месте, отсутствующая — добавляется в конец. Общая логика веток claude-cli
+/// (`--effort`) и grok-cli (`--reasoning-effort`).
+fn set_pair_arg(extra_args: &mut Vec<String>, flag: &str, value: &str) {
+    if let Some(pos) = extra_args.iter().position(|arg| arg == flag) {
+        if pos + 1 < extra_args.len() {
+            extra_args[pos + 1] = value.to_string();
+        } else {
+            extra_args.push(value.to_string());
+        }
+    } else {
+        extra_args.push(flag.to_string());
+        extra_args.push(value.to_string());
+    }
+}
+
 /// Записать усилие рассуждений в аргументы CLI. `true` — усилие ушло в
 /// аргументы; `false` — провайдер не CLI, значение кладёт вызывающий (в
 /// `extra_body`).
@@ -163,16 +179,12 @@ pub fn set_effort_arg(provider: &str, extra_args: &mut Vec<String>, effort: &str
     match provider {
         // claude-cli: пара `--effort <значение>`.
         "claude-cli" => {
-            if let Some(pos) = extra_args.iter().position(|arg| arg == "--effort") {
-                if pos + 1 < extra_args.len() {
-                    extra_args[pos + 1] = effort.to_string();
-                } else {
-                    extra_args.push(effort.to_string());
-                }
-            } else {
-                extra_args.push("--effort".to_string());
-                extra_args.push(effort.to_string());
-            }
+            set_pair_arg(extra_args, "--effort", effort);
+            true
+        }
+        // grok-cli: пара `--reasoning-effort <значение>` — логика та же.
+        "grok-cli" => {
+            set_pair_arg(extra_args, "--reasoning-effort", effort);
             true
         }
         // codex-cli: `-c model_reasoning_effort="<значение>"`.

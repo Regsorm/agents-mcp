@@ -141,7 +141,7 @@ pub struct ExecutionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
-    /// "openrouter" | "anthropic" | "claude-cli" | "codex-cli" | "mock"
+    /// "openrouter" | "anthropic" | "claude-cli" | "codex-cli" | "grok-cli" | "mock"
     pub provider: String,
     pub name: String,
     #[serde(default)]
@@ -625,6 +625,29 @@ fn codex_cli_ignored_fields_warning(config: &AgentConfig) -> Option<String> {
     })
 }
 
+/// Поля общего договора, которые адаптер grok-cli не применяет. `cwd` в этом
+/// списке НЕТ: `cwd_template` grok-cli нужен — по нему служба ограничивает
+/// область ключа вызова, а значит и файловые инструменты (`fs_*`).
+fn grok_cli_ignored_fields_warning(config: &AgentConfig) -> Option<String> {
+    if config.model.provider != "grok-cli" {
+        return None;
+    }
+    let execution = config.execution.as_ref()?;
+    let mut fields = Vec::new();
+    if execution.permission_mode.is_some() {
+        fields.push("permission_mode");
+    }
+    if execution.allowed_roots.is_some() {
+        fields.push("allowed_roots");
+    }
+    (!fields.is_empty()).then(|| {
+        format!(
+            "grok-cli игнорирует поля [execution]: {}",
+            fields.join(", ")
+        )
+    })
+}
+
 fn load_agent(dir: &Path) -> Result<AgentDefinition> {
     let config_path = dir.join("config.toml");
     let raw = std::fs::read_to_string(&config_path)
@@ -677,6 +700,10 @@ fn load_agent(dir: &Path) -> Result<AgentDefinition> {
     }
 
     if let Some(message) = codex_cli_ignored_fields_warning(&config) {
+        warn!(agent = config.name, "{message}");
+    }
+
+    if let Some(message) = grok_cli_ignored_fields_warning(&config) {
         warn!(agent = config.name, "{message}");
     }
 

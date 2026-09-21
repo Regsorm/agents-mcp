@@ -123,6 +123,18 @@ max_concurrent = 2
 # proxy = "http://proxy.example:3128"
 # proxy_bypass = "corp.local"
 
+# Grok через локальный Grok CLI (subprocess `grok`). Авторизация — вход в CLI.
+# user_config нужен для чтения имён личных MCP-серверов: провайдер гасит их в
+# отдельном config.toml вызова, чтобы агент видел только свой mcp_config.
+# Интеграции Claude/Cursor провайдер также отключает окружением процесса
+# GROK_CLAUDE_MCPS_ENABLED=false и GROK_CURSOR_MCPS_ENABLED=false.
+[providers.grok_cli]
+executable = "C:/Users/<пользователь>/.grok/bin/grok.exe"
+user_config = "C:/Users/<пользователь>/.grok/config.toml"
+max_concurrent = 2
+default_max_turns = 40
+tool_timeout_sec = 120
+
 # ── Навыки (push-инъекция skills_index в промпты агентов) ───────────────────
 # Необязательная внешняя библиотека навыков по MCP-адресу: служба читает из неё
 # каталог навыков и подмешивает подходящие в промпты. Пусто — возможность
