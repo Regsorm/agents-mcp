@@ -148,21 +148,33 @@ Steps 1 and 2 are performed together by the example `scripts/clean_copy.py` —
 for the [code-index](https://github.com/Regsorm/code-index-mcp) (`bsl-indexer`):
 
 ```bash
-python scripts/clean_copy.py prepare <project> <copy-name> [--language python]
+python scripts/clean_copy.py prepare <project> <copy-name> --port <port> --alias <alias> [--language python] [--base HEAD] [--files "src/*"]
+python scripts/clean_copy.py commit  <project> <copy-name> --message "<commit message>"
+python scripts/clean_copy.py list
 python scripts/clean_copy.py apply   <project> <copy-name>
 python scripts/clean_copy.py remove  <project> <copy-name>
+python scripts/clean_copy.py remove  <project> --all
 ```
 
 `prepare` creates a copy in `<AGENT_WORK_DIR>/<copy-name>` (`C:/Temp/agent-work`
-by default; on Linux, `agent-work` in the system temporary directory), starts an index at `127.0.0.1:8037` for that copy alone under the
-`work` alias, and verifies that index responses contain no unrelated paths (if
-shared-index configurations are not found, the script warns that the check is
-incomplete). The
+by default; on Linux, `agent-work` in the system temporary directory) on a new
+`agent/<copy-name>` branch from the `--base` commit, starts an index for that copy
+alone at `127.0.0.1:<port>` under the `--alias` alias, and verifies that index
+responses contain no unrelated paths (if shared-index configurations are not
+found, the script warns that the check is incomplete). The port and the alias are
+mandatory, and every copy has its own index home —
+`<AGENT_WORK_DIR>/_indexes/<copy-name>` — so copies of different tasks run
+simultaneously. The optional `--files` sets the edit zone (paths from the project
+root, comma-separated, patterns allowed, for example `src/*`): `commit` refuses
+to record paths outside that zone. `commit` records the copy's changes on its
+`agent/<copy-name>` branch — the branch is merged later — `list` prints one JSON
+line per copy, `apply` transfers changes from the copy to the project without
+committing, `remove` stops the index, deletes the copy and its index home, and
+keeps the `agent/<copy-name>` branch; `remove --all` removes every copy of the
+project. The
 indexer is taken from the `CODE_INDEX_EXE` variable; otherwise, `bsl-indexer` is
 searched for in PATH. Shared-index configurations for the isolation check are
-taken from `CODE_INDEX_MAIN_HOME` (the indexer directory by default). `apply`
-transfers changes from the copy to the project without committing, while
-`remove` stops the index and deletes the copy.
+taken from `CODE_INDEX_MAIN_HOME` (the indexer directory by default).
 
 Only the call result file, service log, and call database remain locally.
 

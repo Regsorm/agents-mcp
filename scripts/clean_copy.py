@@ -8,16 +8,34 @@ health и в ошибке «неизвестный алиас» — а всё э
 
 Поэтому:
 
-* ``prepare`` — git worktree проекта в <AGENT_WORK_DIR>/<имя> от HEAD (в копии
-  только файлы под контролем версий), отдельные демон и ``bsl-indexer serve``
-  со своим CODE_INDEX_HOME на 127.0.0.1:8037 с единственным репозиторием под
-  алиасом ``work`` — демон следит за копией, так что правки агента видны в
-  индексе сразу; затем проверка, что в ответах индекса нет чужих путей;
+* ``prepare`` — git worktree проекта в <AGENT_WORK_DIR>/<имя> на новой ветке
+  ``agent/<имя>`` от указанного коммита (в копии только файлы под контролем
+  версий), отдельные демон и ``bsl-indexer serve`` со своим CODE_INDEX_HOME в
+  <AGENT_WORK_DIR>/_indexes/<имя> на 127.0.0.1:<порт> с единственным
+  репозиторием под указанным алиасом — демон следит за копией, так что правки
+  агента видны в индексе сразу; затем проверка, что в ответах индекса нет чужих
+  путей. Порт и алиас обязательны и у каждой копии свои, поэтому копии разных
+  задач живут одновременно, каждая со своим индексом;
+* ``commit`` — фиксация правок копии на её ветке ``agent/<имя>`` (с ветки работу
+  потом сливают в main — это вне этого скрипта); необязательная зона ``--files``
+  ограничивает, какие пути вообще можно зафиксировать;
 * ``apply`` — перенос изменений копии (с новыми файлами) в рабочий каталог
   проекта через git apply, без фиксации: тесты и фиксация — в самом проекте;
-* ``remove`` — остановка индекса и удаление копии.
+* ``list`` — сведения о копиях: по строке JSON на каждую;
+* ``remove`` — остановка индекса, удаление копии и её дома индекса; ветка
+  ``agent/<имя>`` остаётся — на ней зафиксированная работа. ``remove <проект>
+  --all`` снимает все копии проекта.
 
-Экземпляр индекса один на машину: новая ``prepare`` останавливает прежний.
+Копии, созданные прежней версией скрипта (общий каталог
+<AGENT_WORK_DIR>/_index и постоянные 8037 и ``work``), эта версия не видит и не
+снимает. Снять такую копию вручную::
+
+    CODE_INDEX_HOME=<AGENT_WORK_DIR>/_index bsl-indexer daemon stop
+    # затем остановить процесс serve по PID из <AGENT_WORK_DIR>/_index/clean_serve.pid
+    git worktree remove --force <копия>
+
+Сведения о копии — <AGENT_WORK_DIR>/_indexes/<имя>/copy.json: имя, проект, путь
+копии, ветка, коммит-начало, порт, алиас, язык и зона files.
 
 Настройка переменными окружения:
 
@@ -29,18 +47,23 @@ health и в ошибке «неизвестный алиас» — а всё э
 
 Запуск::
 
-    python scripts/clean_copy.py prepare C:/Projects/my-app задача1 [--language python]
+    python scripts/clean_copy.py prepare C:/Projects/my-app задача1 --port 8037 --alias work --language python --files "src/*"
+    python scripts/clean_copy.py commit  C:/Projects/my-app задача1 --message "Правка по задаче"
+    python scripts/clean_copy.py list
     python scripts/clean_copy.py apply   C:/Projects/my-app задача1
     python scripts/clean_copy.py remove  C:/Projects/my-app задача1
+    python scripts/clean_copy.py remove  C:/Projects/my-app --all
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
-import signal
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -56,17 +79,9 @@ EXE = os.environ.get("CODE_INDEX_EXE") or shutil.which("bsl-indexer") or ""
 MAIN_HOME = Path(os.environ.get("CODE_INDEX_MAIN_HOME") or (Path(EXE).parent if EXE else "."))
 КАТАЛОГ_КОПИЙ = Path("C:/Temp/agent-work") if os.name == "nt" else Path(tempfile.gettempdir()) / "agent-work"
 КОПИИ = Path(os.environ.get("AGENT_WORK_DIR") or КАТАЛОГ_КОПИЙ)
-# Свой CODE_INDEX_HOME экземпляра: свой демон и свой serve. Serve отдаёт
-# содержимое только по путям, которые ведёт демон этого же дома («путь не
-# отслеживается демоном» — проверено 11.09.2026), а общий демон трогать нельзя.
-# Лежит рядом с копиями, но вне каталога любой из них: рабочий каталог
-# агента — только его копия.
-ДОМ = КОПИИ / "_index"
 # Статусы, которыми serve отвечает, пока индекс не готов (TRANSIENT_STATUSES
 # в исходниках code-index).
 НЕ_ГОТОВ = ("not_started", "indexing", "error", "daemon_offline", "unknown_repo")
-PORT = 8037
-ALIAS = "work"
 CREATE_NO_WINDOW = 0x08000000
 
 
@@ -86,10 +101,30 @@ def git_байты(*args: str, cwd: Path | str, env: dict | None = None) -> byte
     return r.stdout
 
 
+def безопасный_git(копия: Path, git_dir: Path, пустые_hooks: str) -> tuple:
+    """Параметры git, при которых команды работают ровно с этой копией и не
+    исполняют чужих хуков: свой каталог учёта, свой рабочий каталог, пустой
+    hooksPath и выключенный fsmonitor."""
+    return ("-c", "core.fsmonitor=false", "-c", f"core.hooksPath={пустые_hooks}",
+            f"--git-dir={git_dir}", f"--work-tree={копия}")
+
+
 # ── экземпляр индекса ────────────────────────────────────────────────────────
 
-def среда() -> dict:
-    return dict(os.environ, CODE_INDEX_HOME=str(ДОМ))
+def каталог_домов() -> Path:
+    """Каталог домов индекса: у каждой копии свой дом (см. `дом`). Старый общий
+    каталог КОПИИ/_index эта версия не читает и не трогает НИКОГДА: там может
+    работать копия прежней версии скрипта."""
+    return КОПИИ / "_indexes"
+
+
+def дом(имя: str) -> Path:
+    """Дом индекса одной копии: <AGENT_WORK_DIR>/_indexes/<имя>."""
+    return каталог_домов() / имя
+
+
+def среда(дом_копии: Path) -> dict:
+    return dict(os.environ, CODE_INDEX_HOME=str(дом_копии))
 
 
 def время_старта(pid: int) -> str:
@@ -108,14 +143,14 @@ def время_старта(pid: int) -> str:
     return r.stdout.strip()
 
 
-def записать_pid(роль: str, pid: int) -> None:
-    (ДОМ / f"clean_{роль}.pid").write_text(
+def записать_pid(дом_копии: Path, роль: str, pid: int) -> None:
+    (дом_копии / f"clean_{роль}.pid").write_text(
         json.dumps({"pid": pid, "start": время_старта(pid)}), encoding="utf-8")
 
 
-def прочитать_pid(роль: str) -> tuple[int, str] | None:
+def прочитать_pid(дом_копии: Path, роль: str) -> tuple[int, str] | None:
     try:
-        запись = json.loads((ДОМ / f"clean_{роль}.pid").read_text(encoding="utf-8"))
+        запись = json.loads((дом_копии / f"clean_{роль}.pid").read_text(encoding="utf-8"))
         return int(запись["pid"]), str(запись["start"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
@@ -134,24 +169,29 @@ def жив_индексатор(pid: int, старт: str) -> bool:
     return "bsl-indexer" in r.stdout.lower() and время_старта(pid) == старт
 
 
-def остановить_индекс() -> None:
+def роль_жива(дом_копии: Path, роль: str) -> bool:
+    запись = прочитать_pid(дом_копии, роль)
+    return запись is not None and жив_индексатор(*запись)
+
+
+def остановить_индекс(дом_копии: Path) -> None:
     # Демон — штатно, через свой дом (POST /stop); общий демон при этом не
     # задевается: адрес берётся из daemon.json этого дома. Команда возвращается
     # раньше, чем демон закроет базу в копии, — без ожидания удаление копии
     # падает с «Invalid argument» (11.09.2026).
-    if (ДОМ / "daemon.json").exists():
-        subprocess.run([EXE, "daemon", "stop"], env=среда(), cwd=ДОМ,
+    if (дом_копии / "daemon.json").exists():
+        subprocess.run([EXE, "daemon", "stop"], env=среда(дом_копии), cwd=дом_копии,
                        capture_output=True, timeout=30)
-        демон = прочитать_pid("daemon")
+        демон = прочитать_pid(дом_копии, "daemon")
         for _ in range(20):
             if демон is None or not жив_индексатор(*демон):
                 break
             time.sleep(0.5)
     for роль in ("serve", "daemon"):
-        pid_файл = ДОМ / f"clean_{роль}.pid"
+        pid_файл = дом_копии / f"clean_{роль}.pid"
         if not pid_файл.exists():
             continue
-        запись = прочитать_pid(роль)
+        запись = прочитать_pid(дом_копии, роль)
         # Гасим только процесс, записанный этим скриптом: PID и момент запуска
         # обязаны совпасть, иначе процесс чужой — его не трогаем.
         if запись is not None and жив_индексатор(*запись):
@@ -164,39 +204,40 @@ def остановить_индекс() -> None:
         pid_файл.unlink()
 
 
-def запустить(роль: str, аргументы: list[str]) -> subprocess.Popen:
-    журнал = open(ДОМ / f"{роль}.log", "a", encoding="utf-8")
-    параметры = dict(cwd=ДОМ, env=среда(), stdin=subprocess.DEVNULL,
+def запустить(дом_копии: Path, роль: str, аргументы: list[str]) -> subprocess.Popen:
+    журнал = open(дом_копии / f"{роль}.log", "a", encoding="utf-8")
+    параметры = dict(cwd=дом_копии, env=среда(дом_копии), stdin=subprocess.DEVNULL,
                      stdout=журнал, stderr=subprocess.STDOUT)
     if os.name == "nt":
         параметры["creationflags"] = CREATE_NO_WINDOW
     p = subprocess.Popen([EXE, *аргументы], **параметры)
-    записать_pid(роль, p.pid)
+    записать_pid(дом_копии, роль, p.pid)
     return p
 
 
-def запустить_индекс(копия: Path, язык: str) -> None:
+def запустить_индекс(копия: Path, дом_копии: Path, язык: str, порт: int, алиас: str) -> None:
     # Значения уходят в TOML: язык — только имя, путь — экранированной строкой.
     if not re.fullmatch(r"[A-Za-z0-9_+-]+", язык):
         raise SystemExit(f"недопустимый --language: {язык!r}")
-    ДОМ.mkdir(parents=True, exist_ok=True)
+    дом_копии.mkdir(parents=True, exist_ok=True)
     путь = копия.as_posix()
-    (ДОМ / "daemon.toml").write_text(
+    (дом_копии / "daemon.toml").write_text(
         "# Один репозиторий — чистая копия для исполнителя (clean_copy.py).\n"
         "[daemon]\nhttp_port = 0\n\n"
-        f'[[paths]]\npath = {json.dumps(путь, ensure_ascii=False)}\nalias = "{ALIAS}"\nlanguage = "{язык}"\n',
+        f'[[paths]]\npath = {json.dumps(путь, ensure_ascii=False)}\nalias = "{алиас}"\nlanguage = "{язык}"\n',
         encoding="utf-8")
-    (ДОМ / "serve.toml").write_text(
+    (дом_копии / "serve.toml").write_text(
         "# Единственный репозиторий, локальный, никакой федерации.\n"
         '[me]\nip = "127.0.0.1"\n\n'
-        f'[[paths]]\nalias = "{ALIAS}"\nip = "127.0.0.1"\nport = {PORT}\n',
+        f'[[paths]]\nalias = "{алиас}"\nip = "127.0.0.1"\nport = {порт}\n',
         encoding="utf-8")
     # daemon.json прежнего запуска указал бы на мёртвый процесс.
-    (ДОМ / "daemon.json").unlink(missing_ok=True)
-    демон = запустить("daemon", ["daemon", "run"])
-    serve = запустить("serve", [
-        "serve", "--transport", "http", "--host", "127.0.0.1", "--port", str(PORT),
-        "--config", str(ДОМ / "daemon.toml"), "--serve-config", str(ДОМ / "serve.toml")])
+    (дом_копии / "daemon.json").unlink(missing_ok=True)
+    демон = запустить(дом_копии, "daemon", ["daemon", "run"])
+    serve = запустить(дом_копии, "serve", [
+        "serve", "--transport", "http", "--host", "127.0.0.1", "--port", str(порт),
+        "--config", str(дом_копии / "daemon.toml"),
+        "--serve-config", str(дом_копии / "serve.toml")])
     начало = time.time()
     while time.time() - начало < 120:
         time.sleep(1)
@@ -205,27 +246,27 @@ def запустить_индекс(копия: Path, язык: str) -> None:
         # Сбой — только ненулевой код запускающего процесса.
         for роль, p in (("daemon", демон), ("serve", serve)):
             if p.poll() not in (None, 0) or (роль == "serve" and p.poll() == 0):
-                хвост = (ДОМ / f"{роль}.log").read_text(encoding="utf-8")[-1500:]
-                остановить_индекс()
+                хвост = (дом_копии / f"{роль}.log").read_text(encoding="utf-8")[-1500:]
+                остановить_индекс(дом_копии)
                 raise SystemExit(f"{роль} завершился с кодом {p.returncode}:\n{хвост}")
         try:
-            ответ = вызвать("list_files", {"repo": ALIAS, "limit": 1})
+            ответ = вызвать(порт, "list_files", {"repo": алиас, "limit": 1})
         except Exception:
             continue          # serve ещё не слушает порт
         if not any(f'\\"status\\":\\"{с}\\"' in ответ or f'"status":"{с}"' in ответ
                    for с in НЕ_ГОТОВ):
-            pid_демона = json.loads((ДОМ / "daemon.json").read_text(encoding="utf-8"))["pid"]
-            записать_pid("daemon", int(pid_демона))
+            pid_демона = json.loads((дом_копии / "daemon.json").read_text(encoding="utf-8"))["pid"]
+            записать_pid(дом_копии, "daemon", int(pid_демона))
             print(f"[индекс] готов за {time.time() - начало:.0f} с: демон PID {pid_демона}, "
-                  f"serve PID {serve.pid}, порт {PORT}, алиас {ALIAS}")
+                  f"serve PID {serve.pid}, порт {порт}, алиас {алиас}")
             return
-    остановить_индекс()
-    raise SystemExit("индекс копии не готов за 120 с — см. журналы в " + str(ДОМ))
+    остановить_индекс(дом_копии)
+    raise SystemExit("индекс копии не готов за 120 с — см. журналы в " + str(дом_копии))
 
 
-def вызвать(инструмент: str, аргументы: dict) -> str:
+def вызвать(порт: int, инструмент: str, аргументы: dict) -> str:
     """Вызов инструмента индекса по MCP; возвращает текст ответа целиком."""
-    адрес = f"http://127.0.0.1:{PORT}/mcp"
+    адрес = f"http://127.0.0.1:{порт}/mcp"
     заголовки = {"Content-Type": "application/json",
                  "Accept": "application/json, text/event-stream"}
 
@@ -246,7 +287,7 @@ def вызвать(инструмент: str, аргументы: dict) -> str:
     return текст
 
 
-def чужие_метки() -> set[str]:
+def чужие_метки(алиас: str) -> set[str]:
     """Пути и алиасы всех репозиториев общего индекса — их не должно быть в ответах."""
     метки: set[str] = set()
     for имя in ("daemon.toml", "serve.toml"):
@@ -254,30 +295,53 @@ def чужие_метки() -> set[str]:
         if f.exists():
             t = f.read_text(encoding="utf-8", errors="replace")
             метки |= set(re.findall(r'^\s*(?:path|alias)\s*=\s*"([^"]+)"', t, re.M))
-    метки.discard(ALIAS)
+    метки.discard(алиас)
     return {м.replace("\\", "/").lower() for м in метки if len(м) > 3}
 
 
-def проверить_изоляцию() -> None:
-    чужие = чужие_метки()
+def проверить_изоляцию(дом_копии: Path, порт: int, алиас: str) -> None:
+    чужие = чужие_метки(алиас)
     if not чужие:
         print(f"[изоляция] в {MAIN_HOME} нет конфигов общего индекса — сверять не с чем, "
               "проверка неполная (задайте CODE_INDEX_MAIN_HOME)")
     проверки = {
         "get_stats без repo": ("get_stats", {}),
-        "health": ("health", {"repo": ALIAS}),
+        "health": ("health", {"repo": алиас}),
         "неизвестный алиас": ("get_stats", {"repo": "нет-такого-репо"}),
     }
     for название, (инструмент, арг) in проверки.items():
-        ответ = вызвать(инструмент, арг)
+        ответ = вызвать(порт, инструмент, арг)
         # Ответ — JSON с экранированными обратными косыми; сравниваем в одном виде.
         плоский = ответ.replace("\\\\", "/").replace("\\", "/").lower()
         найдено = sorted(м for м in чужие if м in плоский)
         if найдено:
-            остановить_индекс()
+            остановить_индекс(дом_копии)
             raise SystemExit(f"[изоляция] {название}: в ответе чужие репозитории {найдено}"
                              " — индекс остановлен")
         print(f"[изоляция] {название}: чужих путей нет")
+
+
+def порт_занят(порт: int) -> bool:
+    """Занят ли порт на петлевом адресе: подключиться удалось — занят."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as сокет:
+        сокет.settimeout(1)
+        try:
+            сокет.connect(("127.0.0.1", порт))
+        except OSError:
+            return False
+    return True
+
+
+def проверить_порт(порт: int | None) -> int:
+    if порт is None or not 1024 <= порт <= 65535:
+        raise SystemExit(f"недопустимый --port {порт!r}: нужно целое 1024..65535")
+    return порт
+
+
+def проверить_алиас(алиас: str | None) -> str:
+    if not алиас or not re.fullmatch(r"[A-Za-z0-9_-]+", алиас):
+        raise SystemExit(f"недопустимый --alias {алиас!r}: только буквы, цифры, _ и -")
+    return алиас
 
 
 # ── команды ──────────────────────────────────────────────────────────────────
@@ -370,21 +434,78 @@ def удалить_каталог(копия: Path) -> None:
     if код or операция.fAnyOperationsAborted:
         raise SystemExit(f"не удалось переместить {копия} в Корзину (код {код})")
 
-def prepare(проект: Path, имя: str, язык: str) -> None:
+
+def ветка_существует(проект: Path, ветка: str) -> bool:
+    r = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{ветка}"],
+                       cwd=проект, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return r.returncode == 0
+
+
+def имя_ветки_годно(проект: Path, ветка: str) -> bool:
+    r = subprocess.run(["git", "check-ref-format", "--branch", ветка], cwd=проект,
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    return r.returncode == 0
+
+
+def разобрать_файлы(значение: str | None) -> list[str] | None:
+    """--files: пути через запятую, пустые элементы отброшены; не задан — None."""
+    if значение is None:
+        return None
+    return [часть.strip() for часть in значение.split(",") if часть.strip()]
+
+
+def прочитать_copy(дом_копии: Path) -> dict:
+    данные = json.loads((дом_копии / "copy.json").read_text(encoding="utf-8"))
+    if not isinstance(данные, dict):
+        raise ValueError("copy.json — не объект JSON")
+    return данные
+
+
+def prepare(проект: Path, имя: str, язык: str, порт: int, алиас: str,
+            база: str = "HEAD", файлы: list[str] | None = None) -> None:
     копия = путь_копии(имя)
+    дом_копии = дом(имя)
     if копия.exists():
         raise SystemExit(f"копия {копия} уже есть — сначала remove")
-    остановить_индекс()
+    if дом_копии.exists():
+        raise SystemExit(f"дом индекса {дом_копии} уже есть — сначала remove")
+    проверить_порт(порт)
+    проверить_алиас(алиас)
+    if порт_занят(порт):
+        raise SystemExit(f"порт {порт} занят — возьмите другой --port")
+    ветка = f"agent/{имя}"
+    if not имя_ветки_годно(проект, ветка):
+        raise SystemExit(f"имя копии не годится для ветки {ветка!r}")
+    if ветка_существует(проект, ветка):
+        raise SystemExit(f"ветка {ветка} уже есть — сначала снимите её или возьмите другое имя")
+    sha = git("rev-parse", "--verify", f"{база}^{{commit}}", cwd=проект).strip()
     КОПИИ.mkdir(parents=True, exist_ok=True)
     # Хуки проекта при создании копии не выполняются — как и при переносе.
     with tempfile.TemporaryDirectory(prefix="clean-copy-hooks-") as пустые_hooks:
-        git("-c", f"core.hooksPath={пустые_hooks}", "worktree", "add", "--detach",
-            str(копия), "HEAD", cwd=проект)
-    запустить_индекс(копия, язык)
-    проверить_изоляцию()
-    print(json.dumps({"work_dir": копия.as_posix(), "repo": ALIAS, "port": PORT},
+        git("-c", f"core.hooksPath={пустые_hooks}", "worktree", "add", "-b", ветка,
+            str(копия), sha, cwd=проект)
+    # Сведения о копии пишутся до запуска индекса: list и remove должны видеть
+    # и копию с упавшим индексом.
+    дом_копии.mkdir(parents=True, exist_ok=True)
+    (дом_копии / "copy.json").write_text(json.dumps({
+        "name": имя,
+        "project": проект.resolve().as_posix(),
+        "copy": копия.as_posix(),
+        "branch": ветка,
+        "base": sha,
+        "port": порт,
+        "alias": алиас,
+        "language": язык,
+        "files": файлы,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    запустить_индекс(копия, дом_копии, язык, порт, алиас)
+    проверить_изоляцию(дом_копии, порт, алиас)
+    адрес = f"http://127.0.0.1:{порт}/mcp"
+    print(json.dumps({"work_dir": копия.as_posix(), "repo": алиас, "port": порт,
+                      "branch": ветка, "base": sha, "code_index_url": адрес},
                      ensure_ascii=False))
-    print(f"--code-index-url http://127.0.0.1:{PORT}/mcp")
+    print(f"--code-index-url {адрес}")
 
 
 def apply(проект: Path, имя: str) -> None:
@@ -404,8 +525,7 @@ def apply(проект: Path, имя: str) -> None:
     # Системный конфиг отключён переменной ниже.
     окружение = dict(os.environ, GIT_CONFIG_NOSYSTEM="1")
     with tempfile.TemporaryDirectory(prefix="clean-copy-hooks-") as пустые_hooks:
-        безопасные = ("-c", "core.fsmonitor=false", "-c", f"core.hooksPath={пустые_hooks}",
-                      f"--git-dir={git_dir}", f"--work-tree={копия}")
+        безопасные = безопасный_git(копия, git_dir, пустые_hooks)
         git(*безопасные, "add", "-A", cwd=копия, env=окружение)
         git(*безопасные, "rm", "--cached", "-r", "-q", "--ignore-unmatch", "--",
             ".code-index", cwd=копия, env=окружение)
@@ -421,15 +541,99 @@ def apply(проект: Path, имя: str) -> None:
     print(f"[перенос] изменения в {проект}, не зафиксированы; заплатка — {файл}")
 
 
+def commit(проект: Path, имя: str, сообщение: str) -> None:
+    копия = путь_копии(имя)
+    дом_копии = дом(имя)
+    git_dir = доверенный_git_dir(проект, копия)
+    if git_dir is None:
+        raise SystemExit("копия не является рабочей копией этого проекта")
+    проверить_git_файл(копия, git_dir)
+    try:
+        сведения = прочитать_copy(дом_копии)
+    except (OSError, ValueError, UnicodeError):
+        raise SystemExit(f"не читаются сведения о копии {дом_копии / 'copy.json'}"
+                         " — снимите копию через remove и создайте заново") from None
+    ветка = f"agent/{имя}"
+    if сведения.get("branch") != ветка:
+        raise SystemExit(f"в {дом_копии / 'copy.json'} указана чужая ветка"
+                         f" вместо {ветка}")
+    зона = сведения.get("files")
+    if зона is not None and not isinstance(зона, list):
+        raise SystemExit(f"в {дом_копии / 'copy.json'} поле files не список")
+    # Безопасные параметры git — те же, что при переносе: чужие хуки не
+    # исполняются, индекс копии в коммит не попадает.
+    окружение = dict(os.environ, GIT_CONFIG_NOSYSTEM="1")
+    with tempfile.TemporaryDirectory(prefix="clean-copy-hooks-") as пустые_hooks:
+        безопасные = безопасный_git(копия, git_dir, пустые_hooks)
+        текущая_ветка = git(*безопасные, "rev-parse", "--abbrev-ref", "HEAD",
+                             cwd=копия, env=окружение).strip()
+        if текущая_ветка != ветка:
+            raise SystemExit(f"копия сейчас на ветке {текущая_ветка}, "
+                             f"ожидалась {ветка}; фиксация отменена")
+        git(*безопасные, "add", "-A", cwd=копия, env=окружение)
+        git(*безопасные, "rm", "--cached", "-r", "-q", "--ignore-unmatch", "--",
+            ".code-index", cwd=копия, env=окружение)
+        изменённые = [os.fsdecode(поле) for поле in
+                      git_байты(*безопасные, "diff", "--cached", "--name-only", "-z",
+                                "HEAD", cwd=копия, env=окружение).split(b"\0") if поле]
+        # Предупреждение — до проверки «изменений нет»: если агент создал только
+        # скрытые файлы, без него фиксация молча сообщала бы, что работы нет.
+        скрытые = [файл for файл in
+                   (os.fsdecode(поле).rstrip("/") for поле in
+                    git_байты(*безопасные, "ls-files", "--others", "--ignored",
+                              "--exclude-standard", "--directory", "-z",
+                              cwd=копия, env=окружение).split(b"\0") if поле)
+                   if файл != ".code-index"]
+        if скрытые:
+            print("[фиксация] внимание: не попали в коммит (скрыты .gitignore "
+                  "или .git/info/exclude):")
+            for файл in скрытые[:20]:
+                print("  " + файл)
+            if len(скрытые) > 20:
+                print(f"  и ещё {len(скрытые) - 20}")
+        if not изменённые:
+            print("[фиксация] изменений в копии нет")
+            return
+        if зона is not None:
+            вне = [путь for путь in изменённые
+                   if not any(fnmatch.fnmatchcase(путь, шаблон) for шаблон in зона)]
+            if вне:
+                # Снять индексацию, файлы в копии не трогать.
+                git(*безопасные, "reset", "-q", cwd=копия, env=окружение)
+                raise SystemExit("[фиксация] вне зоны --files: " + ", ".join(вне))
+        git(*безопасные, "commit", "-q", "-m", сообщение, cwd=копия, env=окружение)
+        sha = git(*безопасные, "rev-parse", "--short", "HEAD",
+                  cwd=копия, env=окружение).strip()
+    print(f"[фиксация] {sha} на ветке {ветка}: {len(изменённые)} файлов")
+
+
+def список() -> None:
+    for файл in sorted(каталог_домов().glob("*/copy.json")):
+        try:
+            сведения = прочитать_copy(файл.parent)
+        except (OSError, ValueError, UnicodeError) as ошибка:
+            print(json.dumps({"name": файл.parent.name, "error": str(ошибка)},
+                             ensure_ascii=False))
+            continue
+        запись = dict(сведения)
+        копия = сведения.get("copy")
+        запись["copy_exists"] = bool(isinstance(копия, str) and копия
+                                     and Path(копия).is_dir())
+        запись["daemon_alive"] = роль_жива(файл.parent, "daemon")
+        запись["serve_alive"] = роль_жива(файл.parent, "serve")
+        print(json.dumps(запись, ensure_ascii=False))
+
+
 def remove(проект: Path, имя: str) -> None:
     копия = путь_копии(имя)
+    дом_копии = дом(имя)
     была_рабочей_копией = False
     if копия.exists():
         была_рабочей_копией = (доверенный_git_dir(проект, копия) is not None
                                or копия_в_списке_worktree(проект, копия))
         if not была_рабочей_копией:
             raise SystemExit("копия не является рабочей копией этого проекта")
-    остановить_индекс()
+    остановить_индекс(дом_копии)
     if была_рабочей_копией and копия.exists():
         r = subprocess.run(["git", "worktree", "remove", "--force", str(копия)], cwd=проект,
                            capture_output=True, text=True, encoding="utf-8", errors="replace")
@@ -445,23 +649,99 @@ def remove(проект: Path, имя: str) -> None:
     if git_dir is not None and git_dir.parent == общий_git_каталог(проект) / "worktrees":
         shutil.rmtree(git_dir, ignore_errors=True)
     print(f"[копия] {копия} удалена")
+    # Ветку agent/<имя> не трогаем: на ней зафиксированная работа.
+    if дом_копии.exists():
+        try:
+            shutil.rmtree(дом_копии, ignore_errors=False)
+        except OSError as ошибка:
+            raise SystemExit(f"[индекс] дом {дом_копии} не удалён: {ошибка}") from None
+        else:
+            print(f"[индекс] дом {дом_копии} удалён")
+
+
+def remove_all(проект: Path) -> None:
+    цель = проект.resolve()
+    ошибки: list[str] = []
+    for файл in sorted(каталог_домов().glob("*/copy.json")):
+        try:
+            сведения = прочитать_copy(файл.parent)
+        except (OSError, ValueError, UnicodeError) as ошибка:
+            ошибки.append(f"{файл.parent.name}: {ошибка}")
+            continue
+        записанный = сведения.get("project")
+        if not isinstance(записанный, str) or not записанный:
+            ошибки.append(f"{файл.parent.name}: в copy.json нет поля project")
+            continue
+        try:
+            совпадает = Path(записанный).resolve() == цель
+        except OSError:
+            совпадает = False
+        if not совпадает:
+            continue
+        # Имя копии задаёт каталог дома; поле в JSON не должно
+        # позволять снять другую копию.
+        имя = файл.parent.name
+        try:
+            remove(проект, имя)
+        except SystemExit as ошибка:
+            ошибки.append(f"{имя}: {ошибка}")
+        except Exception as ошибка:
+            ошибки.append(f"{имя}: {ошибка}")
+    if ошибки:
+        raise SystemExit("не сняты копии:\n  " + "\n  ".join(ошибки))
 
 
 def main() -> None:
     разбор = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    разбор.add_argument("команда", choices=("prepare", "apply", "remove"))
-    разбор.add_argument("проект", type=Path, help="корень git-репозитория проекта")
-    разбор.add_argument("имя", help="имя копии — каталог в AGENT_WORK_DIR")
+    разбор.add_argument("команда", choices=("prepare", "apply", "commit", "list", "remove"))
+    разбор.add_argument("проект", type=Path, nargs="?", help="корень git-репозитория проекта")
+    разбор.add_argument("имя", nargs="?", help="имя копии — каталог в AGENT_WORK_DIR")
     разбор.add_argument("--language", default="python",
                         help="язык индекса копии (как в daemon.toml)")
+    разбор.add_argument("--port", type=int, help="порт индекса копии, целое 1024..65535")
+    разбор.add_argument("--alias", help="алиас репозитория копии в индексе")
+    разбор.add_argument("--base", default="HEAD",
+                        help="коммит или ветка проекта — начало ветки agent/<имя>")
+    разбор.add_argument("--files", help="зона правок: пути от корня проекта через запятую, "
+                                        "допускаются шаблоны (fnmatch)")
+    разбор.add_argument("--message", help="текст фиксации для commit")
+    разбор.add_argument("--all", action="store_true", help="remove: снять все копии проекта")
     a = разбор.parse_args()
-    if a.команда != "apply" and not EXE:
+    if a.команда == "prepare":
+        if a.проект is None or not a.имя:
+            raise SystemExit("для prepare нужны <проект> и <имя>")
+        if a.port is None or not a.alias:
+            raise SystemExit("для prepare обязательны --port и --alias")
+    elif a.команда == "commit":
+        if a.проект is None or not a.имя:
+            raise SystemExit("для commit нужны <проект> и <имя>")
+        if not a.message:
+            raise SystemExit("для commit обязателен --message с текстом фиксации")
+    elif a.команда == "apply":
+        if a.проект is None or not a.имя:
+            raise SystemExit("для apply нужны <проект> и <имя>")
+    elif a.команда == "list":
+        if a.проект is not None or a.имя is not None:
+            raise SystemExit("для list не нужны <проект> и <имя>")
+    elif a.команда == "remove":
+        if a.проект is None:
+            raise SystemExit("для remove нужен <проект>")
+        if bool(a.имя) == bool(a.all):
+            raise SystemExit("для remove нужно ровно одно: <имя> или --all")
+    if a.команда in ("prepare", "remove") and not EXE:
         raise SystemExit("не найден индексатор: задайте CODE_INDEX_EXE "
                          "или добавьте bsl-indexer в PATH")
     if a.команда == "prepare":
-        prepare(a.проект, a.имя, a.language)
+        prepare(a.проект, a.имя, a.language, a.port, a.alias, a.base,
+                разобрать_файлы(a.files))
+    elif a.команда == "commit":
+        commit(a.проект, a.имя, a.message)
     elif a.команда == "apply":
         apply(a.проект, a.имя)
+    elif a.команда == "list":
+        список()
+    elif a.all:
+        remove_all(a.проект)
     else:
         remove(a.проект, a.имя)
 
