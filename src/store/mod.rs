@@ -144,26 +144,30 @@ pub enum StoreError {
 }
 
 pub(crate) fn validate_task_status(status: &str) -> Result<()> {
-    if matches!(status, "running" | "needs_input" | "completed" | "failed") {
-        Ok(())
-    } else {
-        Err(StoreError::InvalidTaskStatus(status.to_string()).into())
+    match status {
+        "running" | "needs_input" | "completed" | "failed" | "cancelled" => Ok(()),
+        other => Err(StoreError::InvalidTaskStatus(other.to_string()).into()),
     }
 }
 
 pub(crate) fn validate_task_status_transition(current: &str, next: &str) -> Result<()> {
     validate_task_status(next)?;
+    // `cancelled` — закрытый статус: цепочку остановили вручную (chain_cancel),
+    // и обратно в `running` её уже не пускаем.
     let allowed = current == next
         || matches!(
             (current, next),
             ("queued", "running")
                 | ("queued", "failed")
+                | ("queued", "cancelled")
                 | ("running", "needs_input")
                 | ("running", "completed")
                 | ("running", "failed")
+                | ("running", "cancelled")
                 | ("needs_input", "running")
                 | ("needs_input", "completed")
                 | ("needs_input", "failed")
+                | ("needs_input", "cancelled")
                 | ("completed", "running")
                 | ("failed", "running")
         );
@@ -308,8 +312,12 @@ pub trait Store: Send + Sync {
     /// Создать корневую задачу (статус running), вернуть её id.
     async fn create_task(&self, t: &NewTask) -> Result<i64>;
 
-    /// Сменить статус задачи (running/needs_input/completed/failed).
+    /// Сменить статус задачи (running/needs_input/completed/failed/cancelled).
     async fn set_task_status(&self, task_id: i64, status: &str) -> Result<()>;
+
+    /// Текущий статус задачи; None — задачи с таким id нет (нужен `chain_cancel`
+    /// и tool `task_get`, чтобы решить, закрыта задача или ещё идёт).
+    async fn get_task_status(&self, task_id: i64) -> Result<Option<String>>;
 
     /// Записать/обновить артефакт доски задачи (upsert по (task_id,key)).
     #[allow(clippy::too_many_arguments)]

@@ -18,9 +18,10 @@ MCP-сервер платформы специализированных LLM-а�
 ## Возможности
 
 - **MCP-инструменты**: вызов агентов — `invoke_agent`, `agent_run` (пуск в фон
-  без ожидания), `wait_agent`, `agent_cancel`; сведения — `list_agents`,
+  без ожидания), `wait_agent`, `agent_cancel`, `chain_cancel` (остановка всей
+  цепочки работ по задаче); сведения — `list_agents`,
   `get_agent_info`, `agent_history`, `health`; управление службой —
-  `config_reload`, `prepare_shutdown`; доска задач — `task_create`,
+  `config_reload`, `prepare_shutdown`; доска задач — `task_create`, `task_get`,
   `task_set_status`, `artifact_write`, `artifact_read`, `event_append`;
   файловые — `fs_read_file`, `fs_write_file`, `fs_edit_file`, `fs_mkdir`,
   `fs_list_dir`; навыки — `skill_load`.
@@ -29,6 +30,12 @@ MCP-сервер платформы специализированных LLM-а�
   режимов не держит вызывающего, поэтому клиенту не нужен скрипт-посредник.
 - **Отмена фонового вызова** — `agent_cancel`: строка вызова закрывается
   ошибкой, файл-итог дописывается, ждущий не зависает.
+- **Остановка цепочки работ** — `chain_cancel(task_id)`: отменяет все живые
+  фоновые вызовы задачи и помечает саму задачу `cancelled` (ответ перечисляет
+  отменённые `call_id`; закрытая задача — `already_closed`, неизвестная —
+  `not_found`). Так останавливают цепочку `scripts/code_chain.py`: её скрипт сам
+  видит статус `cancelled`, дописывает `result.json` со статусом `cancelled` и
+  завершается кодом 4 — снимать процессы Windows больше не нужно.
 - **Поставщики моделей**: прямые HTTP-подключения через
   `[providers.direct.<имя>]` бывают OpenAI-совместимыми (`api = "openai"`, это
   значение по умолчанию) и Anthropic Messages (`api = "anthropic"`, включая

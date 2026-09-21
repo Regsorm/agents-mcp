@@ -264,7 +264,19 @@ struct LiveCall {
     agent: String,
     /// Файл-итог фонового вызова (agent_run); None — итог ждут по call_id.
     result_path: Option<PathBuf>,
+    /// Задача task-store, к которой привязан вызов (`task_id` запроса); None —
+    /// вызов вне задачи. По ней работает tool `chain_cancel`: у остановки
+    /// цепочки нет call_id, есть только задача.
+    task_id: Option<i64>,
     started: Instant,
+}
+
+/// Запись реестра синхронных вызовов (invoke без wait_sec): агент, начало и
+/// задача, если она известна из запроса.
+struct SyncCall {
+    agent: String,
+    started: Instant,
+    task_id: Option<i64>,
 }
 
 /// Реестр живых вызовов: `call_id` → задача + данные для отмены (фоновые) либо
@@ -278,10 +290,10 @@ struct LiveCall {
 #[derive(Default)]
 pub struct CallRegistry {
     inner: std::sync::Mutex<HashMap<i64, LiveCall>>,
-    /// Синхронные вызовы (invoke_agent без wait_sec): `call_id` → (агент, начало).
-    /// Запись держит [`SyncCallGuard`], поэтому снимается и при обрыве
+    /// Синхронные вызовы (invoke_agent без wait_sec): `call_id` → агент, начало
+    /// и задача. Запись держит [`SyncCallGuard`], поэтому снимается и при обрыве
     /// HTTP-запроса вместе с будущим.
-    sync: std::sync::Mutex<HashMap<i64, (String, Instant)>>,
+    sync: std::sync::Mutex<HashMap<i64, SyncCall>>,
 }
 
 /// Живой вызов, каким его видно снаружи (tool `agent_cancel`, tool
@@ -294,6 +306,9 @@ pub struct LiveCallInfo {
     /// true — фоновый вызов (agent_run или invoke_agent с wait_sec): его можно
     /// отменить через agent_cancel. false — синхронный: отменить нельзя.
     pub background: bool,
+    /// Задача task-store, к которой привязан вызов; None — вызов вне задачи
+    /// либо задача синхронного вызова неизвестна.
+    pub task_id: Option<i64>,
 }
 
 /// Сторож синхронного вызова: снимает запись из реестра при своём Drop.
@@ -387,6 +402,26 @@ pub enum CancelOutcome {
     Finished { call_id: i64, status: String },
 }
 
+/// Исход `Runtime::cancel_task` (tool `chain_cancel`): остановка всей цепочки
+/// работ по задаче, а не одного вызова.
+#[derive(Debug)]
+pub enum TaskCancelOutcome {
+    /// Живые вызовы задачи отменены, сама задача помечена `cancelled`.
+    Cancelled {
+        task_id: i64,
+        /// call_id вызовов, оборванных этой отменой (те, что успели завершиться
+        /// сами между выборкой и отменой, сюда не попадают).
+        cancelled_calls: Vec<i64>,
+        previous_status: String,
+        status: String,
+    },
+    /// Задача уже закрыта (completed/failed/cancelled): её статус не меняем.
+    /// Совпавшие живые фоновые вызовы к этому моменту уже остановлены.
+    AlreadyClosed { task_id: i64, status: String },
+    /// Задачи с таким id в task-store нет.
+    NotFound { task_id: i64 },
+}
+
 impl CallRegistry {
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<i64, LiveCall>> {
         // Отравление мьютекса тут ничего не сообщает: в критической секции
@@ -397,11 +432,19 @@ impl CallRegistry {
     /// Зарегистрировать синхронный вызов (invoke без wait_sec): пока он идёт,
     /// служба не считает себя свободной — `prepare_shutdown` его дожидается.
     /// Запись снимает [`SyncCallGuard`] при своём Drop.
-    pub(crate) fn register_sync(self: &Arc<Self>, call_id: i64, agent: String) -> SyncCallGuard {
-        self.sync
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(call_id, (agent, Instant::now()));
+    pub(crate) fn register_sync(
+        self: &Arc<Self>,
+        call_id: i64,
+        agent: String,
+        task_id: Option<i64>,
+    ) -> SyncCallGuard {
+        let call = SyncCall {
+            agent,
+            started: Instant::now(),
+            task_id,
+        };
+        let mut map = self.sync.lock().unwrap_or_else(|e| e.into_inner());
+        map.insert(call_id, call);
         SyncCallGuard {
             registry: Arc::clone(self),
             call_id,
@@ -424,10 +467,14 @@ impl CallRegistry {
     /// тогда запись появляется раньше, чем задача успеет снять себя. Иначе
     /// мгновенно завершившийся вызов оставил бы в реестре фантом — вызов,
     /// которого уже нет, но который числится отменяемым.
-    fn spawn_registered<F>(&self, call_id: i64, agent: String, result_path: Option<PathBuf>, job: F)
-    where
-        F: FnOnce() -> tokio::task::JoinHandle<()>,
-    {
+    fn spawn_registered<F: FnOnce() -> tokio::task::JoinHandle<()>>(
+        &self,
+        call_id: i64,
+        agent: String,
+        result_path: Option<PathBuf>,
+        task_id: Option<i64>,
+        job: F,
+    ) {
         let mut map = self.lock();
         let handle = job();
         map.insert(
@@ -436,6 +483,7 @@ impl CallRegistry {
                 handle,
                 agent,
                 result_path,
+                task_id,
                 started: Instant::now(),
             },
         );
@@ -468,19 +516,36 @@ impl CallRegistry {
                     agent: c.agent.clone(),
                     elapsed_sec: c.started.elapsed().as_secs(),
                     background: true,
+                    task_id: c.task_id,
                 })
                 .collect()
         };
         {
             let map = self.sync.lock().unwrap_or_else(|e| e.into_inner());
-            out.extend(map.iter().map(|(call_id, (agent, started))| LiveCallInfo {
+            out.extend(map.iter().map(|(call_id, c)| LiveCallInfo {
                 call_id: *call_id,
-                agent: agent.clone(),
-                elapsed_sec: started.elapsed().as_secs(),
+                agent: c.agent.clone(),
+                elapsed_sec: c.started.elapsed().as_secs(),
                 background: false,
+                task_id: c.task_id,
             }));
         }
         out.sort_by_key(|c| c.call_id);
+        out
+    }
+
+    /// `call_id` живых фоновых вызовов указанной задачи, по возрастанию. По ним
+    /// [`Runtime::cancel_task`] останавливает цепочку целиком: у неё на руках
+    /// только task_id. Синхронные вызовы сюда не попадают — их отменить нельзя,
+    /// они держат своего вызывающего.
+    pub fn calls_of_task(&self, task_id: i64) -> Vec<i64> {
+        let mut out: Vec<i64> = self
+            .lock()
+            .iter()
+            .filter(|(_, call)| call.task_id == Some(task_id))
+            .map(|(call_id, _)| *call_id)
+            .collect();
+        out.sort_unstable();
         out
     }
 }
@@ -862,9 +927,14 @@ impl Runtime {
         self.require_store()?.create_task(&t).await
     }
 
-    /// Сменить статус задачи (running/needs_input/completed/failed).
+    /// Сменить статус задачи (running/needs_input/completed/failed/cancelled).
     pub async fn task_set_status(&self, task_id: i64, status: &str) -> anyhow::Result<()> {
         self.require_store()?.set_task_status(task_id, status).await
+    }
+
+    /// Текущий статус задачи (бэкенд tool `task_get`); None — задачи нет.
+    pub async fn task_status(&self, task_id: i64) -> anyhow::Result<Option<String>> {
+        self.require_store()?.get_task_status(task_id).await
     }
 
     /// Записать/обновить артефакт доски задачи (upsert по task_id+key).
@@ -937,6 +1007,8 @@ impl Runtime {
         let timeout_sec = self.run_timeout(&req)?;
         let deadline = tokio::time::Instant::from_std(start) + Duration::from_secs(timeout_sec);
         let wait_sec = req.wait_sec;
+        // Задача запроса: по ней вызов привязывается к цепочке (chain_cancel).
+        let task_id = req.task_id;
 
         // Приём вызова: при закрытом приёме (prepare_shutdown) отказ ДО любой
         // работы — строка вызова не создаётся.
@@ -972,9 +1044,9 @@ impl Runtime {
                 Prepared::Ready(ready) => {
                     // Синхронный вызов виден реестру: пока он идёт,
                     // prepare_shutdown его дожидается.
-                    let _sync_guard = self
-                        .calls
-                        .register_sync(ready.call_id, ready.agent_name.clone());
+                    let _sync_guard =
+                        self.calls
+                            .register_sync(ready.call_id, ready.agent_name.clone(), task_id);
                     drop(admission);
                     match execute_ready_guarded(self.pg.clone(), *ready).await {
                         Ok(CompletedCall::Done(resp)) => Ok(InvokeOutcome::Sync(resp)),
@@ -1011,7 +1083,7 @@ impl Runtime {
                     // себя из него последним действием: пока запись жива, вызов
                     // отменяем, а завершённые в реестре не копятся.
                     self.calls
-                        .spawn_registered(call_id, agent_name, None, move || {
+                        .spawn_registered(call_id, agent_name, None, task_id, move || {
                             tokio::spawn(async move {
                                 let _guard = BackgroundCallGuard {
                                     registry: calls,
@@ -1116,11 +1188,17 @@ impl Runtime {
                 let name_in_job = agent_name.clone();
                 let finalization_deadline = ready.deadline + Duration::from_secs(10);
                 let calls = self.calls.clone();
+                // Задача запроса: по ней вызов отменяет chain_cancel.
+                let task_id = req.task_id;
                 // Файл-итог известен заранее — храним его в реестре вместе с
                 // задачей: отмена обязана закрыть файл, иначе тот, кто ждёт его
                 // появления, зависнет навсегда.
-                self.calls
-                    .spawn_registered(call_id, agent_name, Some(path.clone()), move || {
+                self.calls.spawn_registered(
+                    call_id,
+                    agent_name,
+                    Some(path.clone()),
+                    task_id,
+                    move || {
                         tokio::spawn(async move {
                             let _guard = BackgroundCallGuard {
                                 registry: calls,
@@ -1151,7 +1229,8 @@ impl Runtime {
                                       "не записал файл-итог фонового вызова");
                             }
                         })
-                    });
+                    },
+                );
                 // Вызов виден реестру — счётчик подготовки больше не нужен.
                 drop(admission);
                 Ok(StartedJob::Running {
@@ -1372,6 +1451,65 @@ impl Runtime {
             agent: entry.agent,
             elapsed_sec,
         }
+    }
+
+    /// Остановить цепочку по задаче (бэкенд tool `chain_cancel`): отменить все
+    /// живые фоновые вызовы задачи и пометить её `cancelled`.
+    ///
+    /// Сначала вызовы отменяются тем же путём, что `agent_cancel`: строка
+    /// закрывается ошибкой «вызов отменён вручную», файл-итог дописывается
+    /// конвертом ошибки. Затем читается статус задачи: закрытый итог не
+    /// перезаписывается, а неизвестная задача возвращается как `NotFound`.
+    pub async fn cancel_task(&self, task_id: i64) -> anyhow::Result<TaskCancelOutcome> {
+        let mut cancelled_calls: Vec<i64> = Vec::new();
+        for call_id in self.calls.calls_of_task(task_id) {
+            match self.cancel(call_id).await {
+                // Отчитываемся только об оборванных нами: вызов, успевший
+                // завершиться сам между выборкой и отменой, отменять уже нечем.
+                CancelOutcome::Cancelled { call_id, .. } => cancelled_calls.push(call_id),
+                CancelOutcome::Finished { .. } | CancelOutcome::NotFound { .. } => {}
+            }
+        }
+
+        let previous_status = match self.task_status(task_id).await? {
+            Some(status) => status,
+            None => return Ok(TaskCancelOutcome::NotFound { task_id }),
+        };
+        // Закрытый статус не перезаписываем: честный итог задачи важнее
+        // запоздалой команды остановки.
+        if matches!(
+            previous_status.as_str(),
+            "completed" | "failed" | "cancelled"
+        ) {
+            return Ok(TaskCancelOutcome::AlreadyClosed {
+                task_id,
+                status: previous_status,
+            });
+        }
+
+        self.task_set_status(task_id, "cancelled").await?;
+        let payload = serde_json::json!({
+            "reason": "остановлено вручную",
+            "cancelled_calls": cancelled_calls,
+        })
+        .to_string();
+        self.task_append_event(
+            task_id,
+            "chain_cancelled",
+            None,
+            None,
+            Some(payload.as_str()),
+        )
+        .await?;
+        let cancelled = cancelled_calls.len();
+        warn!(task_id, cancelled, "цепочка остановлена вручную");
+
+        Ok(TaskCancelOutcome::Cancelled {
+            task_id,
+            cancelled_calls,
+            previous_status,
+            status: "cancelled".to_string(),
+        })
     }
 
     /// Оборвать фоновые вызовы при штатном завершении процесса и закрыть их
@@ -3309,7 +3447,7 @@ mod tests {
     #[tokio::test]
     async fn registry_shows_live_call_and_hides_removed() {
         let reg = CallRegistry::default();
-        reg.spawn_registered(7, "mock-agent".to_string(), None, spawn_sleeping);
+        reg.spawn_registered(7, "mock-agent".to_string(), None, None, spawn_sleeping);
 
         let live = reg.live_calls();
         assert_eq!(live.len(), 1, "зарегистрированный вызов виден в реестре");
@@ -3334,7 +3472,7 @@ mod tests {
     #[tokio::test]
     async fn take_and_abort_stops_the_task() {
         let reg = CallRegistry::default();
-        reg.spawn_registered(11, "mock-agent".to_string(), None, spawn_sleeping);
+        reg.spawn_registered(11, "mock-agent".to_string(), None, None, spawn_sleeping);
 
         let entry = reg.take(11).expect("вызов числится живым");
         entry.handle.abort();
@@ -4758,6 +4896,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Запустить `count` фоновых вызовов агента `test` в задаче task_id. Агент
+    /// висит (PendingProvider), пока вызов не отменят; возвращаются call_id.
+    async fn start_background_calls(runtime: &Runtime, task_id: i64, count: usize) -> Vec<i64> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            let mut request = cache_req();
+            request.wait_sec = Some(0);
+            request.task_id = Some(task_id);
+            match runtime.invoke(request).await.expect("запуск звена") {
+                InvokeOutcome::Running { call_id } => out.push(call_id),
+                _ => panic!("ожидался запущенный вызов"),
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn cancel_task_stops_only_its_calls_and_marks_task_cancelled() {
+        let (runtime, store, _registry, dir) = cache_runtime("", "answer");
+        runtime
+            .providers
+            .write()
+            .expect("провайдеры")
+            .insert("fixed".into(), Arc::new(PendingProvider));
+        let blank = crate::store::NewTask::default();
+        let task_a = store.create_task(&blank).await.expect("задача A");
+        let task_b = store.create_task(&blank).await.expect("задача B");
+        let calls_a = start_background_calls(&runtime, task_a, 2).await;
+        let calls_b = start_background_calls(&runtime, task_b, 2).await;
+        assert_eq!(runtime.calls.calls_of_task(task_a), calls_a);
+
+        let outcome = runtime.cancel_task(task_a).await;
+        match outcome.expect("отмена задачи A") {
+            TaskCancelOutcome::Cancelled {
+                task_id,
+                cancelled_calls,
+                previous_status,
+                status,
+            } => {
+                assert_eq!(task_id, task_a);
+                assert_eq!(cancelled_calls, calls_a);
+                assert_eq!(previous_status, "running");
+                assert_eq!(status, "cancelled");
+            }
+            other => panic!("ожидалась отмена задачи, получено {other:?}"),
+        }
+        let state = store.get_task_status(task_a).await;
+        assert_eq!(state.expect("статус A"), Some("cancelled".to_string()));
+
+        // Чужая задача не задета: её вызовы живы, и цепочку по ней вести можно.
+        for call_id in &calls_b {
+            assert!(runtime.calls.contains(*call_id));
+        }
+        assert!(
+            runtime.calls.calls_of_task(task_a).is_empty(),
+            "вызовы отменённой задачи обязаны уйти из реестра"
+        );
+        assert_eq!(runtime.calls.calls_of_task(task_b), calls_b);
+
+        // Повторная отмена и неизвестная задача — внятные исходы, а не паника.
+        let again = runtime.cancel_task(task_a).await;
+        assert!(matches!(again, Ok(TaskCancelOutcome::AlreadyClosed { .. })));
+        let unknown = runtime.cancel_task(999_999).await;
+        assert!(matches!(unknown, Ok(TaskCancelOutcome::NotFound { .. })));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn orphan_result_path_uses_saved_explicit_path() {
         let dir =
@@ -4887,7 +5093,7 @@ mod tests {
     #[test]
     fn sync_guard_is_live_and_removed_on_drop() {
         let reg = Arc::new(CallRegistry::default());
-        let guard = reg.register_sync(7, "a".to_string());
+        let guard = reg.register_sync(7, "a".to_string(), None);
 
         let live = reg.live_calls();
         assert_eq!(live.len(), 1, "синхронный вызов виден в реестре");
@@ -4921,7 +5127,7 @@ mod tests {
         let history = runtime.history(None, None, 10).await.expect("история");
         assert!(history.is_empty(), "строка вызова не должна создаваться");
 
-        let parent = runtime.calls.register_sync(999, "parent".to_string());
+        let parent = runtime.calls.register_sync(999, "parent".to_string(), None);
         let child = runtime.invoke(invoke_req("drain-agent", Some(999))).await;
         assert!(child.is_ok(), "дочерний вызов идущего принимается");
 

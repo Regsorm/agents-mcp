@@ -23,7 +23,7 @@ use crate::health::{HealthResponse, ProviderStatus};
 use crate::registry::Registry;
 use crate::runtime::{
     CallScope, CancelOutcome, DrainStatus, InvokeOutcome, InvokeRequest, Runtime, StartedJob,
-    CALL_KEY_HEADER,
+    TaskCancelOutcome, CALL_KEY_HEADER,
 };
 
 const MAX_EDIT_FILE_SIZE: u64 = 5 * 1024 * 1024;
@@ -453,14 +453,27 @@ pub struct ArtifactReadParams {
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct TaskStatusParams {
     pub task_id: i64,
-    /// running | needs_input | completed | failed.
+    /// running | needs_input | completed | failed | cancelled.
     pub status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ChainCancelParams {
+    /// Задача task-store, цепочку по которой надо остановить (task_id из
+    /// `task_create` / ответа цепочки).
+    pub task_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TaskGetParams {
+    pub task_id: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct EventAppendParams {
     pub task_id: i64,
-    /// user_input | agent_start | agent_done | artifact_written | error | status_change.
+    /// user_input | agent_start | agent_done | artifact_written | error |
+    /// status_change | chain_cancelled.
     pub event_type: String,
     #[serde(default)]
     pub agent: Option<String>,
@@ -779,7 +792,7 @@ impl AgentsMcpServer {
                        elapsed_sec}. Строка вызова в истории при этом закрывается ошибкой «вызов \
                        отменён вручную», а файл-итог дописывается конвертом ошибки — тот, кто ждёт \
                        его появления, не зависает. \
-                       Без call_id — список живых вызовов: {live:[{call_id, agent, elapsed_sec, background}]}. \
+                       Без call_id — список живых вызовов: {live:[{call_id, agent, elapsed_sec, background, task_id}]}. \
                        Если живого вызова нет: {status:\"not_found\", call_id, hint}; если вызов уже \
                        завершён либо идёт внутри синхронного запроса: {status:\"already_finished\", \
                        call_id, call_status, hint}. \
@@ -806,6 +819,7 @@ impl AgentsMcpServer {
                             "agent": c.agent,
                             "elapsed_sec": c.elapsed_sec,
                             "background": c.background,
+                            "task_id": c.task_id,
                         })
                     })
                     .collect();
@@ -839,6 +853,52 @@ impl AgentsMcpServer {
                          синхронного запроса — такой вызов отменить нельзя",
             })
             .to_string(),
+        }
+    }
+
+    #[tool(
+        description = "Остановить цепочку работ по задаче одним вызовом: отменить все её живые \
+                       ФОНОВЫЕ вызовы и пометить саму задачу статусом cancelled. Это штатный способ \
+                       остановить scripts/code_chain.py: снятие процессов Windows оставляло задачи \
+                       платформы незакрытыми, а result.json — не записанным. Отменяются только вызовы \
+                       с этим task_id; вызовы других задач не задеваются. Отменённое звено закрывается \
+                       ошибкой «вызов отменён вручную» (файл-итог тоже дописывается конвертом ошибки), \
+                       а сам скрипт цепочки видит отмену статусом задачи между звеньями и в цикле \
+                       ожидания wait_agent, пишет result.json со статусом cancelled и завершается \
+                       кодом 4. \
+                       Ответ: {status:\"cancelled\", task_id, cancelled_calls:[call_id], previous_status}; \
+                       задача уже закрыта (completed/failed/cancelled) — \
+                       {status:\"already_closed\", task_id, task_status}; задачи нет — \
+                       {status:\"not_found\", task_id}. Отменяются ТОЛЬКО фоновые вызовы \
+                       (agent_run и invoke_agent с wait_sec): вызов внутри синхронного запроса держит \
+                       вызывающего, его остаётся только переждать."
+    )]
+    pub async fn chain_cancel(&self, Parameters(p): Parameters<ChainCancelParams>) -> String {
+        match self.runtime.cancel_task(p.task_id).await {
+            Ok(TaskCancelOutcome::Cancelled {
+                task_id,
+                cancelled_calls,
+                previous_status,
+                status,
+            }) => serde_json::json!({
+                "status": status,
+                "task_id": task_id,
+                "cancelled_calls": cancelled_calls,
+                "previous_status": previous_status,
+            })
+            .to_string(),
+            Ok(TaskCancelOutcome::AlreadyClosed { task_id, status }) => serde_json::json!({
+                "status": "already_closed",
+                "task_id": task_id,
+                "task_status": status,
+            })
+            .to_string(),
+            Ok(TaskCancelOutcome::NotFound { task_id }) => serde_json::json!({
+                "status": "not_found",
+                "task_id": task_id,
+            })
+            .to_string(),
+            Err(e) => err_json(&format!("{e}")),
         }
     }
 
@@ -987,8 +1047,10 @@ impl AgentsMcpServer {
     }
 
     #[tool(
-        description = "Сменить статус задачи в task-store: running | needs_input | completed | failed. \
-                       Для completed/failed выставляется finished_at. \
+        description = "Сменить статус задачи в task-store: running | needs_input | completed | failed | \
+                       cancelled. Статус `cancelled` (остановлено вручную) из закрытых обратно не \
+                       открывается — для этого заводится новая задача. \
+                       Для completed/failed/cancelled выставляется finished_at. \
                        Возвращает {\"ok\": true} либо {\"error\": \"...\"}."
     )]
     pub async fn task_set_status(&self, Parameters(p): Parameters<TaskStatusParams>) -> String {
@@ -999,8 +1061,30 @@ impl AgentsMcpServer {
     }
 
     #[tool(
+        description = "Прочитать состояние задачи из task-store: {task_id, status}. Нужен тому, кто \
+                       ведёт работу по задаче (цепочка code_chain.py) — по status=\"cancelled\" он \
+                       видит остановку вручную (chain_cancel) и сворачивается сам. Задачи нет — \
+                       {status:\"not_found\", task_id, hint}; отказ хранилища — {\"error\": \"...\"}."
+    )]
+    pub async fn task_get(&self, Parameters(p): Parameters<TaskGetParams>) -> String {
+        match self.runtime.task_status(p.task_id).await {
+            Ok(Some(status)) => {
+                serde_json::json!({ "task_id": p.task_id, "status": status }).to_string()
+            }
+            Ok(None) => serde_json::json!({
+                "status": "not_found",
+                "task_id": p.task_id,
+                "hint": "задачи с таким id в task-store нет: проверьте task_id",
+            })
+            .to_string(),
+            Err(e) => serde_json::json!({ "error": format!("{e}") }).to_string(),
+        }
+    }
+
+    #[tool(
         description = "Добавить событие в журнал задачи (durable event-stream task-store). event_type: \
-                       user_input | agent_start | agent_done | artifact_written | error | status_change. \
+                       user_input | agent_start | agent_done | artifact_written | error | status_change | \
+                       chain_cancelled. \
                        seq присваивается автоматически. Возвращает {\"ok\": true} либо {\"error\": \"...\"}."
     )]
     pub async fn event_append(&self, Parameters(p): Parameters<EventAppendParams>) -> String {

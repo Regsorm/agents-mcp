@@ -139,7 +139,7 @@ impl Store for PgStore {
         Ok(row.get::<_, i64>(0))
     }
 
-    /// Сменить статус задачи; для completed/failed выставить finished_at.
+    /// Сменить статус задачи; для completed/failed/cancelled выставить finished_at.
     async fn set_task_status(&self, task_id: i64, status: &str) -> Result<()> {
         let client = self.client().await?;
         let current = client
@@ -155,7 +155,7 @@ impl Store for PgStore {
         let changed = client
             .execute(
                 "UPDATE agents_mcp.tasks SET status=$2, updated_at=now(), \
-                 finished_at = CASE WHEN $2 IN ('completed','failed') THEN now() ELSE NULL END \
+                 finished_at = CASE WHEN $2 IN ('completed','failed','cancelled') THEN now() ELSE NULL END \
                  WHERE id=$1",
                 &[&task_id, &status],
             )
@@ -165,6 +165,19 @@ impl Store for PgStore {
             return Err(StoreError::TaskNotFound(task_id).into());
         }
         Ok(())
+    }
+
+    /// Текущий статус задачи; None — такой задачи нет.
+    async fn get_task_status(&self, task_id: i64) -> Result<Option<String>> {
+        let client = self.client().await?;
+        let row = client
+            .query_opt(
+                "SELECT status FROM agents_mcp.tasks WHERE id=$1",
+                &[&task_id],
+            )
+            .await
+            .map_err(|error| postgres_error("task-store: SELECT status", &error))?;
+        Ok(row.map(|row| row.get::<_, String>(0)))
     }
 
     /// Записать/обновить артефакт (upsert по (task_id,key)). Вернуть его id.
@@ -350,7 +363,7 @@ impl Store for PgStore {
             .map_err(|error| postgres_error("retention: BEGIN", &error))?;
         tx.execute(
             "DELETE FROM agents_mcp.tasks AS task \
-             WHERE task.status IN ('completed', 'failed') \
+             WHERE task.status IN ('completed', 'failed', 'cancelled') \
                AND task.updated_at < to_timestamp($1::bigint) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM agents_mcp.task_artifacts AS artifact \

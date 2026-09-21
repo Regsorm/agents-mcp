@@ -1292,14 +1292,14 @@ impl OpenRouterProvider {
                 &reasoning
             };
             return Err(LlmError::Loop {
-                provider: self.name.clone(),
-                channel: channel.to_string(),
-                reason,
-                line: truncate(&line, 120),
+                provider: self.name.clone().into(),
+                channel: channel.into(),
+                reason: reason.into(),
+                line: truncate(&line, 120).into(),
                 repeats: n,
                 reasoning_chars: reasoning.len(),
                 content_chars: content.len(),
-                tail: tail_chars(source, LOOP_TAIL_CHARS),
+                tail: tail_chars(source, LOOP_TAIL_CHARS).into(),
             });
         }
 
@@ -2012,7 +2012,7 @@ fn describe_messages(messages: &[Value]) -> Value {
         let tool = m["tool_call_id"].as_str().unwrap_or("").to_string();
         sizes.push((len, role, tool));
     }
-    sizes.sort_by(|a, b| b.0.cmp(&a.0));
+    sizes.sort_by_key(|(len, _, _)| std::cmp::Reverse(*len));
     let roles: Vec<Value> = by_role
         .iter()
         .map(|(role, (n, chars))| json!({"роль": role, "сообщений": n, "знаков": chars}))
@@ -3360,15 +3360,14 @@ Let me write the final code:\n\
         // по типу), но её текст уходит в report.json и в журнал, поэтому в нём
         // должны остаться все числа живого обрыва 31.08.2026.
         let real = LlmError::Loop {
-            provider: "local-llm".to_string(),
-            channel: "размышлении".to_string(),
-            reason: "строка «Результат = Запрос.Выполнить().Выгрузить();» повторена 6 раз"
-                .to_string(),
-            line: "\tРезультат = Запрос.Выполнить().Выгрузить();".to_string(),
+            provider: "local-llm".into(),
+            channel: "размышлении".into(),
+            reason: "строка «Результат = Запрос.Выполнить().Выгрузить();» повторена 6 раз".into(),
+            line: "\tРезультат = Запрос.Выполнить().Выгрузить();".into(),
             repeats: 6,
             reasoning_chars: 33_128,
             content_chars: 0,
-            tail: "хвост размышления".to_string(),
+            tail: "хвост размышления".into(),
         };
         let text = real.to_string();
         assert!(text.contains("ход прерван в размышлении"));
@@ -3379,14 +3378,14 @@ Let me write the final code:\n\
         // Обрыв по объёму — та же разновидность с другой причиной: лечится он
         // так же, а различать их нужно только в отчёте.
         let runaway = LlmError::Loop {
-            provider: "local-llm".to_string(),
-            channel: "размышлении".to_string(),
-            reason: runaway_reason(298_727),
-            line: "- Remove the JOIN with the group.".to_string(),
+            provider: "local-llm".into(),
+            channel: "размышлении".into(),
+            reason: runaway_reason(298_727).into(),
+            line: "- Remove the JOIN with the group.".into(),
             repeats: 92,
             reasoning_chars: 298_727,
             content_chars: 0,
-            tail: "хвост размышления".to_string(),
+            tail: "хвост размышления".into(),
         };
         assert!(runaway.to_string().contains("объём хода 298727 знаков"));
 

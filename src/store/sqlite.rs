@@ -204,7 +204,7 @@ impl Store for SqliteStore {
         .await
     }
 
-    /// Сменить статус задачи; для completed/failed выставить finished_at.
+    /// Сменить статус задачи; для completed/failed/cancelled выставить finished_at.
     async fn set_task_status(&self, task_id: i64, status: &str) -> Result<()> {
         let status = status.to_string();
         self.run(move |conn| {
@@ -222,7 +222,7 @@ impl Store for SqliteStore {
                 .execute(
                     "UPDATE tasks SET status=?2, \
                  updated_at = CAST(strftime('%s','now') AS INTEGER), \
-                 finished_at = CASE WHEN ?2 IN ('completed','failed') \
+                 finished_at = CASE WHEN ?2 IN ('completed','failed','cancelled') \
                    THEN CAST(strftime('%s','now') AS INTEGER) ELSE NULL END \
                  WHERE id=?1",
                     rusqlite::params![task_id, status],
@@ -232,6 +232,20 @@ impl Store for SqliteStore {
                 return Err(StoreError::TaskNotFound(task_id).into());
             }
             Ok(())
+        })
+        .await
+    }
+
+    /// Текущий статус задачи; None — такой задачи нет.
+    async fn get_task_status(&self, task_id: i64) -> Result<Option<String>> {
+        self.run(move |conn| {
+            conn.query_row(
+                "SELECT status FROM tasks WHERE id=?1",
+                rusqlite::params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("task-store: SELECT status")
         })
         .await
     }
@@ -434,7 +448,7 @@ impl Store for SqliteStore {
             let tx = conn.transaction().context("retention: BEGIN")?;
             tx.execute(
                 "DELETE FROM tasks AS task \
-                 WHERE task.status IN ('completed', 'failed') \
+                 WHERE task.status IN ('completed', 'failed', 'cancelled') \
                    AND task.updated_at < ?1 \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM task_artifacts AS artifact \

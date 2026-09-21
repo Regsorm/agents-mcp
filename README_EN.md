@@ -10,9 +10,10 @@ you write the agents yourself (the format is described in ["Adding a New Agent"]
 ## Features
 
 - **MCP tools**: agent invocation — `invoke_agent`, `agent_run` (starts in the
-  background without waiting), `wait_agent`, `agent_cancel`; information —
+  background without waiting), `wait_agent`, `agent_cancel`, `chain_cancel`
+  (stops the whole chain of work for a task); information —
   `list_agents`, `get_agent_info`, `agent_history`, `health`; service management —
-  `config_reload`, `prepare_shutdown`; task board — `task_create`,
+  `config_reload`, `prepare_shutdown`; task board — `task_create`, `task_get`,
   `task_set_status`, `artifact_write`, `artifact_read`, `event_append`;
   file tools — `fs_read_file`, `fs_write_file`, `fs_edit_file`, `fs_mkdir`,
   `fs_list_dir`; skills — `skill_load`.
@@ -21,6 +22,12 @@ you write the agents yourself (the format is described in ["Adding a New Agent"]
   Neither mode holds the caller, so the client does not need an intermediary script.
 - **Background call cancellation** — `agent_cancel`: the call row is closed with
   an error, the result file is completed, and a waiter does not hang.
+- **Chain stop** — `chain_cancel(task_id)`: cancels every live background call of
+  the task and marks the task `cancelled` (the reply lists the cancelled
+  `call_id`s; a closed task answers `already_closed`, an unknown one `not_found`).
+  This is how `scripts/code_chain.py` is stopped: the script itself sees the
+  `cancelled` status, writes `result.json` with status `cancelled` and exits with
+  code 4 — killing Windows processes is no longer needed.
 - **Model providers**: direct HTTP connections through
   `[providers.direct.<name>]` can be OpenAI-compatible (`api = "openai"`, the
   default value) or Anthropic Messages (`api = "anthropic"`, including MCP

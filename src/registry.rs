@@ -463,7 +463,7 @@ fn select_active_agents(
 
     let mut agents = HashMap::new();
     for (name, mut definitions) in candidates {
-        definitions.sort_by(|(left, _), (right, _)| left.cmp(right));
+        definitions.sort_by_key(|(path, _)| *path);
         let winner = definitions
             .iter()
             .position(|(path, _)| {
