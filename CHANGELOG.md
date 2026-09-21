@@ -5,6 +5,52 @@
 Формат — [Keep a Changelog 1.0.0](https://keepachangelog.com/ru/1.0.0/),
 версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [1.1.0] — 2026-09-21
+
+### Добавлено
+
+- **Провайдер `grok-cli`** — Grok CLI самостоятельным агентом с
+  MCP-инструментами. Каждый вызов получает свой временный каталог с
+  `.grok/config.toml`: серверы из `[execution] mcp_config` агента, личные
+  серверы пользовательского конфига CLI выключены. Встроенные инструменты CLI
+  сняты; белый список `[execution] allowed_tools` соблюдается запретом
+  остальных инструментов поимённо. Ответ — `--output-format json`, ходы сессии
+  CLI пишутся в `agent_turns`. Настройки — секция `[providers.grok_cli]`.
+- **Параметр `overrides` у `invoke_agent` и `agent_run`** — перекрытие
+  настроек агента на один вызов по закрытому списку ключей: `model.name`,
+  `model.temperature`, `model.max_tokens`, `execution.max_turns`,
+  `limits.timeout_sec`, `effort`, `cache.enabled`, `mcp.<сервер>.url`.
+  Адреса MCP — только уже объявленные агентом серверы и адреса из
+  `[agents] allowed_mcp_urls`. Перекрытия входят в ключ кэша, пишутся в
+  колонку `agent_calls.overrides` и видны в `agent_history`.
+- **Инструменты `chain_cancel` и `task_get`.** `chain_cancel(task_id)`
+  отменяет все живые фоновые вызовы задачи и ставит ей статус `cancelled`;
+  `agent_cancel` показывает `task_id` в списке живых вызовов.
+- **Переключатель `[response] schema_strict`.** При `true` несоответствие
+  ответа файлу `response.schema_file` делает вызов неполным и сохраняет сырой
+  ответ; по умолчанию поведение прежнее — только предупреждение в журнале.
+- **`scripts/clean_copy.py`: несколько копий параллельно.** `prepare` требует
+  `--port` и `--alias`, у каждой копии свой каталог индекса и ветка
+  `agent/<имя>`; новые команды `commit` и `list`, `remove --all`.
+- **CI на GitHub:** на отправку в `main` и запрос слияния — `cargo fmt`,
+  `clippy -D warnings`, тесты, сборка выпуска под Linux и Windows.
+
+### Исправлено
+
+- **Разбор ответа в формате JSON больше не обрезается на чужой рамке.**
+  Закрывающая рамка искалась первым вхождением, и план с примерами кода внутри
+  строкового поля получал статус «неполный». Теперь перебираются кандидаты
+  (ответ целиком, тело рамки, кусок по скобкам) с проверкой разбором; при
+  полном провале сырой ответ сохраняется в `<runs_dir>/<call_id>-<агент>-raw.txt`.
+
+### Совместимость
+
+- Новые миграции `migrations_pg/007_agent_calls_overrides.sql` и
+  `migrations_sqlite/003_agent_calls_overrides.sql` (колонка
+  `agent_calls.overrides`); статус задачи `cancelled` в обоих хранилищах.
+- `clean_copy.py prepare` без `--port` и `--alias` теперь отказывает —
+  значений по умолчанию больше нет.
+
 ## [1.0.2] — 2026-09-20
 
 ### Исправлено
@@ -42,6 +88,7 @@
 
 Первый публичный выпуск: https://github.com/Regsorm/agents-mcp
 
+[1.1.0]: https://github.com/Regsorm/agents-mcp/releases/tag/v1.1.0
 [1.0.2]: https://github.com/Regsorm/agents-mcp/releases/tag/v1.0.2
 [1.0.1]: https://github.com/Regsorm/agents-mcp/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Regsorm/agents-mcp/releases/tag/v1.0.0
