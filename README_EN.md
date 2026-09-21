@@ -317,6 +317,46 @@ provider did not report a price and the model is not described in the
 configuration, `cost_usd` is `null`, without a warning; tokens are still saved.
 Price changes are picked up when the main configuration is reloaded.
 
+### Per-call setting overrides (`overrides`)
+
+`invoke_agent` and the start mode of `agent_run` accept an optional flat
+`overrides` object. It applies to one call only, is not added to `input`, and is
+not inherited by nested calls. The allowed keys are a closed list:
+
+| Key | Value and validation |
+|---|---|
+| `model.name` | Non-empty string; the provider is unchanged |
+| `model.temperature` | Number from 0 to 2 |
+| `model.max_tokens` | Integer greater than 0 |
+| `execution.max_turns` | Integer greater than 0 |
+| `limits.timeout_sec` | Integer greater than 0 |
+| `effort` | Non-empty string; replaces an existing provider effort value |
+| `cache.enabled` | Boolean |
+| `mcp.<server>.url` | URL of an MCP server already declared by the agent |
+
+An unknown key, invalid type, unknown server, or disallowed URL rejects the
+call. Precedence is global `force_provider`/`force_model`, then `overrides`, then
+the agent's `config.toml`. When `allowed_mcp_urls` in `[agents]` is non-empty,
+the URL must exactly match an entry; without that list, only
+`http://127.0.0.1:<port>/mcp` URLs are allowed.
+
+```json
+{
+  "agent": "code-planner",
+  "input": {"task": "Prepare a plan", "work_dir": "C:/Project"},
+  "overrides": {
+    "execution.max_turns": 60,
+    "mcp.code-index.url": "http://127.0.0.1:8037/mcp"
+  }
+}
+```
+
+The chain script has a short option for the same URL:
+
+```powershell
+python scripts/code_chain.py --work-dir C:/Project --task "Fix the defect" --code-index-url http://127.0.0.1:8037/mcp
+```
+
 ### Secrets in configuration
 
 HTTP provider keys are still specified by environment variable name in

@@ -290,6 +290,14 @@ pub struct InvokeAgentParams {
     /// собирает срез артефактов задачи в {{ task_context }}. Опущено — вне задачи.
     #[serde(default)]
     pub task_id: Option<i64>,
+    /// Плоский объект перекрытий настроек агента на ОДИН вызов (`overrides`):
+    /// ключи `model.name`, `model.temperature`, `model.max_tokens`,
+    /// `execution.max_turns`, `limits.timeout_sec`, `effort`, `cache.enabled`,
+    /// `mcp.<сервер>.url`. Список ключей закрытый — неизвестный ключ отказ.
+    /// Действует только на этот вызов, в шаблон промпта не попадает; вложенные
+    /// вызовы (оркестратор → под-агент) его не наследуют.
+    #[serde(default)]
+    pub overrides: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -326,6 +334,12 @@ pub struct AgentRunParams {
     /// с `agent`.
     #[serde(default)]
     pub call_id: Option<i64>,
+    /// Плоский объект перекрытий настроек агента на ОДИН вызов (`overrides`).
+    /// Тот же закрытый список ключей, что у `invoke_agent`; действует только
+    /// на этот вызов, в шаблон промпта не попадает, вложенные вызовы его не
+    /// наследуют.
+    #[serde(default)]
+    pub overrides: Option<serde_json::Map<String, Value>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -620,6 +634,8 @@ impl AgentsMcpServer {
                        {status:\"running\", call_id} (опрашивать через wait_agent), либо {status:\"done\", \
                        result, metadata}, либо {status:\"error\", call_id, error}. \
                        Async нужен оркестраторам, чтобы под-агенты дольше 60с не валили MCP-tool по таймауту. \
+                       Необязательный overrides — плоский объект из закрытого списка настроек только этого \
+                       вызова; в input и вложенные вызовы он не попадает. \
                        При ошибке вызова возвращает {error: \"...\"}."
     )]
     pub async fn invoke_agent(
@@ -643,6 +659,7 @@ impl AgentsMcpServer {
             orchestration_depth,
             wait_sec: p.wait_sec,
             task_id: p.task_id,
+            overrides: p.overrides,
         };
 
         match self.runtime.invoke(req).await {
@@ -668,7 +685,7 @@ impl AgentsMcpServer {
     #[tool(
         description = "Запустить агента в фоне и НЕ ждать его — единственный вызов, который никогда не \
                        блокирует вызывающего (ни на секунду). Два режима у одного tool: \
-                       ПУСК — передать agent (+ input, variant, task_id, result_path): агент уходит \
+                       ПУСК — передать agent (+ input, variant, task_id, result_path, overrides): агент уходит \
                        работать в фон сервиса, ответ приходит сразу: {status:\"running\", call_id, agent, \
                        variant, result_path}. Если ответ нашёлся в кеше — сразу {status:\"done\", result, \
                        metadata, result_path}. \
@@ -682,6 +699,8 @@ impl AgentsMcpServer {
                        Чем отличается от соседей: invoke_agent без wait_sec ждёт агента до конца, \
                        wait_agent держит запрос до 55 с — оба занимают вызывающего; agent_run не ждёт \
                        никогда и файла-итога у тех двух нет. \
+                       overrides — плоский объект из того же закрытого списка, что у invoke_agent; он \
+                       действует только на запускаемый вызов и не наследуется вложенными вызовами. \
                        Ошибки подготовки (агента нет, не хватает обязательных полей input, нет такого \
                        варианта промпта) возвращаются сразу как {error} — в фон такой вызов не уходит."
     )]
@@ -754,6 +773,7 @@ impl AgentsMcpServer {
                     // Ожиданием здесь не управляют: режим всегда «не ждать».
                     wait_sec: Some(0),
                     task_id: p.task_id,
+                    overrides: p.overrides,
                 };
                 match self.runtime.start_background(req, result_path).await {
                     Ok(StartedJob::Running {

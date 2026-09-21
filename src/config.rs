@@ -361,6 +361,10 @@ pub struct AgentsConfig {
     pub force_provider: Option<String>,
     #[serde(default)]
     pub force_model: Option<String>,
+    /// Адреса, разрешённые в перекрытии `mcp.<сервер>.url`. Пусто — умолчание:
+    /// схема `http`, хост `127.0.0.1`, путь `/mcp`, порт задан.
+    #[serde(default)]
+    pub allowed_mcp_urls: Vec<String>,
 }
 
 impl Default for AgentsConfig {
@@ -371,6 +375,7 @@ impl Default for AgentsConfig {
             default_timeout_sec: default_timeout_sec(),
             force_provider: None,
             force_model: None,
+            allowed_mcp_urls: Vec::new(),
         }
     }
 }
@@ -472,6 +477,7 @@ fn unknown_main_config_keys(raw: &str) -> std::result::Result<Vec<String>, toml:
                 "default_timeout_sec",
                 "force_provider",
                 "force_model",
+                "allowed_mcp_urls",
             ],
         ),
         (

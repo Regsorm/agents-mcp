@@ -965,6 +965,18 @@ impl ConfigReloader {
                 new.agents.default_timeout_sec
             ));
         }
+        if new.agents.allowed_mcp_urls != st.cfg.agents.allowed_mcp_urls {
+            self.runtime
+                .set_allowed_mcp_urls(new.agents.allowed_mcp_urls.clone());
+            report.applied.push(format!(
+                "[agents] allowed_mcp_urls: {}",
+                if new.agents.allowed_mcp_urls.is_empty() {
+                    "пусто (правило по умолчанию)".to_string()
+                } else {
+                    new.agents.allowed_mcp_urls.join(", ")
+                }
+            ));
+        }
 
         // ── [agents] agents_dir — подмена каталога реестра ──────────────────
         let dir_changed = new.agents.agents_dir != st.cfg.agents.agents_dir;

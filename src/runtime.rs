@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 
 use crate::cache;
 use crate::health::ProviderStatus;
+use crate::overrides::CallOverrides;
 use crate::providers::mcp_client;
 use crate::providers::{ClaudeCliHints, LlmError, LlmProvider, LlmRequest};
 use crate::registry::{AgentDefinition, ExecutionConfig, Registry, ResponseFormat};
@@ -97,6 +98,11 @@ pub struct InvokeRequest {
     /// {{ task_context }}. None — вызов вне задачи (срез пуст).
     #[serde(default)]
     pub task_id: Option<i64>,
+    /// Плоский объект перекрытий настроек агента на ОДИН вызов (`overrides`).
+    /// Закрытый список ключей; в шаблон промпта не попадает, вложенные вызовы
+    /// его не наследуют.
+    #[serde(default)]
+    pub overrides: Option<Map<String, Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,7 +149,7 @@ enum CompletedCall {
 /// (job не создаём), либо подготовленный к исполнению вызов с зарезервированным
 /// call_id. Boxed — ReadyCall крупный (несёт LlmRequest + Arc-и).
 enum Prepared {
-    CacheHit(InvokeResponse),
+    CacheHit(Box<InvokeResponse>),
     Ready(Box<ReadyCall>),
 }
 
@@ -171,6 +177,8 @@ struct ReadyCall {
     /// Снимок `[storage] runs_dir` на момент подготовки: туда кладётся сырой
     /// ответ модели, если разобрать его как JSON не удалось.
     runs_dir: PathBuf,
+    /// Канонический JSON перекрытий вызова — для метаданных итога.
+    overrides: Option<String>,
 }
 
 /// Строка истории вызовов (`agent_calls`). Тип живёт в хранилище: рантайм
@@ -194,6 +202,11 @@ pub struct InvokeMetadata {
     pub parent_call_id: Option<i64>,
     /// Глубина в дереве оркестрации (0 для корневого вызова).
     pub orchestration_depth: u32,
+    /// Перекрытия вызова (канонический вид). `None` — перекрытий не было.
+    /// `#[serde(default)]` обязателен: тип читается из metadata_json старых
+    /// записей кеша, где поля ещё нет.
+    #[serde(default)]
+    pub overrides: Option<Value>,
 }
 
 #[derive(Debug, Error)]
@@ -249,6 +262,9 @@ pub enum InvokeError {
 
     #[error("служба готовится к остановке: новые вызовы не принимаются")]
     ShuttingDown,
+
+    #[error("перекрытия вызова: {0}")]
+    Overrides(String),
 }
 
 impl From<LlmError> for InvokeError {
@@ -595,6 +611,10 @@ pub struct Runtime {
     call_scopes: CallScopes,
     /// Порт собственного HTTP `/mcp`; задаётся при сборке axum-роутера.
     own_mcp_port: std::sync::RwLock<Option<u16>>,
+    /// Список разрешённых адресов перекрытия `mcp.<сервер>.url`
+    /// ([agents] allowed_mcp_urls). За RwLock: перечитка конфига подменяет его
+    /// на лету. Пусто — действует правило по умолчанию.
+    allowed_mcp_urls: std::sync::RwLock<Vec<String>>,
     /// Экземпляр службы (`[server] instance`, по умолчанию «имя машины:порт»):
     /// пишется в строки вызовов, по нему при старте закрываются свои
     /// осиротевшие вызовы.
@@ -639,7 +659,7 @@ pub enum StartedJob {
     Running { call_id: i64, result_path: PathBuf },
     /// Ответ нашёлся в кеше — готов сразу, файл-итог уже записан.
     Done {
-        response: InvokeResponse,
+        response: Box<InvokeResponse>,
         result_path: PathBuf,
     },
 }
@@ -775,6 +795,7 @@ impl Runtime {
             drain_changed: tokio::sync::Notify::new(),
             call_scopes: Arc::new(std::sync::Mutex::new(HashMap::new())),
             own_mcp_port: std::sync::RwLock::new(None),
+            allowed_mcp_urls: std::sync::RwLock::new(Vec::new()),
             instance,
         }
     }
@@ -883,16 +904,58 @@ impl Runtime {
         *self.provider_env.write().unwrap_or_else(|e| e.into_inner()) = provider_env;
     }
 
-    fn run_timeout(&self, req: &InvokeRequest) -> Result<u64, InvokeError> {
+    /// Подменить список разрешённых адресов перекрытий — перечитка
+    /// `[agents] allowed_mcp_urls`.
+    pub fn set_allowed_mcp_urls(&self, urls: Vec<String>) {
+        *self
+            .allowed_mcp_urls
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = urls;
+    }
+
+    fn run_timeout(&self, req: &InvokeRequest, ov: &CallOverrides) -> Result<u64, InvokeError> {
         let agent = self
             .registry
             .get(&req.agent)
             .ok_or_else(|| InvokeError::AgentNotFound(req.agent.clone()))?;
-        Ok(agent
-            .config
-            .limits
-            .timeout_sec
-            .unwrap_or_else(|| self.default_timeout_sec.load(Ordering::SeqCst)))
+        Ok(ov.timeout_sec.unwrap_or_else(|| {
+            agent
+                .config
+                .limits
+                .timeout_sec
+                .unwrap_or_else(|| self.default_timeout_sec.load(Ordering::SeqCst))
+        }))
+    }
+
+    /// Разобрать перекрытия вызова (`req.overrides`). Агента берём из реестра
+    /// (как в `run_timeout`); имена MCP-серверов агента — из `execution.mcp_config`
+    /// и из `execution.extra_args`. Пустой набор — перекрытий нет.
+    fn parse_overrides(&self, req: &InvokeRequest) -> Result<CallOverrides, InvokeError> {
+        let raw = match &req.overrides {
+            Some(map) if !map.is_empty() => map,
+            _ => return Ok(CallOverrides::default()),
+        };
+        let agent = self
+            .registry
+            .get(&req.agent)
+            .ok_or_else(|| InvokeError::AgentNotFound(req.agent.clone()))?;
+        let mut servers: Vec<String> = Vec::new();
+        if let Some(exec) = &agent.config.execution {
+            if let Some(raw_mcp) = &exec.mcp_config {
+                let parsed = mcp_client::parse_mcp_config(raw_mcp)
+                    .map_err(|e| InvokeError::McpConfig(format!("mcp_config агента: {e}")))?;
+                servers.extend(parsed.into_iter().map(|server| server.alias));
+            }
+            servers.extend(crate::overrides::mcp_servers_of_extra_args(
+                &exec.extra_args,
+            ));
+        }
+        let allowed = self
+            .allowed_mcp_urls
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        CallOverrides::parse(raw, &servers, &allowed).map_err(InvokeError::Overrides)
     }
 
     /// Клон клиента навыков под коротким захватом: guard не живёт через await.
@@ -1004,7 +1067,8 @@ impl Runtime {
     ///   Some(n) → запустить job в фоне, опросить до n сек (Done/Running/Failed).
     pub async fn invoke(&self, req: InvokeRequest) -> Result<InvokeOutcome, InvokeError> {
         let start = Instant::now();
-        let timeout_sec = self.run_timeout(&req)?;
+        let overrides = self.parse_overrides(&req)?;
+        let timeout_sec = self.run_timeout(&req, &overrides)?;
         let deadline = tokio::time::Instant::from_std(start) + Duration::from_secs(timeout_sec);
         let wait_sec = req.wait_sec;
         // Задача запроса: по ней вызов привязывается к цепочке (chain_cancel).
@@ -1021,6 +1085,7 @@ impl Runtime {
                 start,
                 deadline,
                 timeout_sec,
+                &overrides,
                 preparing_call_id.clone(),
             ),
         )
@@ -1040,7 +1105,7 @@ impl Runtime {
         match wait_sec {
             // Синхронный режим — прежнее поведение: ждём завершения inline.
             None => match prepared {
-                Prepared::CacheHit(resp) => Ok(InvokeOutcome::Sync(resp)),
+                Prepared::CacheHit(resp) => Ok(InvokeOutcome::Sync(*resp)),
                 Prepared::Ready(ready) => {
                     // Синхронный вызов виден реестру: пока он идёт,
                     // prepare_shutdown его дожидается.
@@ -1073,7 +1138,7 @@ impl Runtime {
             // Долгий provider.complete() больше не блокирует MCP-ответ —
             // оркестратор опрашивает результат через wait_agent(call_id).
             Some(w) => match prepared {
-                Prepared::CacheHit(resp) => Ok(InvokeOutcome::Done(resp)),
+                Prepared::CacheHit(resp) => Ok(InvokeOutcome::Done(*resp)),
                 Prepared::Ready(ready) => {
                     let call_id = ready.call_id;
                     let agent_name = ready.agent_name.clone();
@@ -1125,7 +1190,8 @@ impl Runtime {
         result_path: Option<PathBuf>,
     ) -> Result<StartedJob, InvokeError> {
         let start = Instant::now();
-        let timeout_sec = self.run_timeout(&req)?;
+        let overrides = self.parse_overrides(&req)?;
+        let timeout_sec = self.run_timeout(&req, &overrides)?;
         let deadline = tokio::time::Instant::from_std(start) + Duration::from_secs(timeout_sec);
         // Приём вызова: при закрытом приёме (prepare_shutdown) отказ ДО любой
         // работы — строка вызова не создаётся.
@@ -1138,6 +1204,7 @@ impl Runtime {
                 start,
                 deadline,
                 timeout_sec,
+                &overrides,
                 preparing_call_id.clone(),
             ),
         )
@@ -1649,6 +1716,7 @@ impl Runtime {
         start: Instant,
         deadline: tokio::time::Instant,
         timeout_sec: u64,
+        overrides: &CallOverrides,
         preparing_call_id: Arc<AtomicI64>,
     ) -> Result<Prepared, InvokeError> {
         // Защита от рекурсивных циклов оркестраторов: каждый invoke,
@@ -1706,10 +1774,17 @@ impl Runtime {
                 (Some(fp), Some(fm)) => (fp.clone(), fm.clone()),
                 _ => (
                     agent.config.model.provider.clone(),
-                    agent.config.model.name.clone(),
+                    overrides
+                        .model_name
+                        .clone()
+                        .unwrap_or_else(|| agent.config.model.name.clone()),
                 ),
             }
         };
+
+        // Канонический вид перекрытий: один и тот же идёт в ключ кеша, в строку
+        // вызова и в метаданные итога.
+        let overrides_json = overrides.canonical_json();
 
         // В промпт идёт ограниченный срез, а в ключ кеша — отпечаток полного
         // состояния: изменения за границей среза тоже инвалидируют ответ.
@@ -1729,7 +1804,10 @@ impl Runtime {
 
         // Один и тот же ключ идёт и в lookup, и в последующий store. В него
         // входят фактические provider/model, исходный prompt.md и отпечаток доски.
-        let cache_key = agent.config.cache.enabled.then(|| {
+        let cache_enabled = overrides
+            .cache_enabled
+            .unwrap_or(agent.config.cache.enabled);
+        let cache_key = cache_enabled.then(|| {
             cache::compute_key(cache::CacheKeyParts {
                 agent_name: &req.agent,
                 variant: &variant,
@@ -1740,6 +1818,7 @@ impl Runtime {
                 input: &req.input,
                 key_fields: &agent.config.cache.key_fields,
                 task_id: req.task_id,
+                overrides: overrides_json.as_deref().unwrap_or(""),
             })
         });
         if let Some(key) = cache_key.as_ref() {
@@ -1752,6 +1831,9 @@ impl Runtime {
                         start,
                         req.parent_call_id,
                         req.orchestration_depth,
+                        overrides_json
+                            .as_deref()
+                            .and_then(|raw| serde_json::from_str(raw).ok()),
                     ) {
                         let call_id = self
                             .pg
@@ -1764,6 +1846,7 @@ impl Runtime {
                                 req.parent_call_id,
                                 req.task_id,
                                 &self.instance,
+                                overrides_json.as_deref(),
                             )
                             .await
                             .map_err(|e| InvokeError::Db(format!("{e}")))?;
@@ -1796,7 +1879,7 @@ impl Runtime {
                             variant = %variant,
                             "cache hit"
                         );
-                        return Ok(Prepared::CacheHit(resp));
+                        return Ok(Prepared::CacheHit(Box::new(resp)));
                     }
                 }
                 Ok(None) => {}
@@ -1862,6 +1945,7 @@ impl Runtime {
                 req.parent_call_id,
                 req.task_id,
                 &self.instance,
+                overrides_json.as_deref(),
             )
             .await
             .map_err(|e| InvokeError::Db(format!("{e}")))?;
@@ -2032,6 +2116,8 @@ impl Runtime {
         // hints (allowed_tools + mcp_config + max_turns) нужны и claude-cli, и
         // прямым провайдерам: openrouter.rs использует их для agentic-loop
         // (веха #3). Session-id логика ниже — только для claude-cli.
+        // Ушло ли усилие рассуждений в аргументы CLI (иначе — в extra_body).
+        let mut effort_in_args = false;
         let mut cli_hints = match &agent.config.execution {
             Some(cli_cfg) => {
                 let mut hints = match build_cli_hints(cli_cfg, &ctx) {
@@ -2042,6 +2128,45 @@ impl Runtime {
                         return Err(err);
                     }
                 };
+                // Перекрытия вызова: ходы и адреса MCP — поверх настроек агента,
+                // ДО collect_mcp_env и врезки ключа вызова (порядок важен: адрес
+                // меняется, а ключ врезается уже в него).
+                if let Some(max_turns) = overrides.max_turns {
+                    hints.max_turns = Some(max_turns);
+                }
+                if !overrides.mcp_urls.is_empty() {
+                    if let Some(raw) = hints.mcp_config.clone() {
+                        match apply_mcp_url_overrides(&raw, &overrides.mcp_urls) {
+                            Ok(updated) => hints.mcp_config = Some(updated),
+                            Err(message) => {
+                                let err = InvokeError::McpConfig(message);
+                                self.fail_prepared_call(call_id, &req.agent, start, &err)
+                                    .await;
+                                return Err(err);
+                            }
+                        }
+                    } else if provider_name != "codex-cli" {
+                        let err = InvokeError::Overrides(
+                            "перекрытие mcp.*.url задано, но у агента нет execution.mcp_config"
+                                .to_string(),
+                        );
+                        self.fail_prepared_call(call_id, &req.agent, start, &err)
+                            .await;
+                        return Err(err);
+                    }
+                    if provider_name == "codex-cli" {
+                        for (server, url) in &overrides.mcp_urls {
+                            crate::overrides::set_mcp_url_args(&mut hints.extra_args, server, url);
+                        }
+                    }
+                }
+                if let Some(effort) = overrides.effort.as_deref() {
+                    effort_in_args = crate::overrides::set_effort_arg(
+                        &provider_name,
+                        &mut hints.extra_args,
+                        effort,
+                    );
+                }
                 let provider_env = self
                     .provider_env
                     .read()
@@ -2120,7 +2245,24 @@ impl Runtime {
 
                 Some(hints)
             }
-            None => None,
+            None => {
+                // Провайдер CLI без секции [execution]: усилие и адреса MCP
+                // передать некуда — отказ (строка вызова уже зарезервирована).
+                if !overrides.mcp_urls.is_empty()
+                    || (overrides.effort.is_some()
+                        && matches!(provider_name.as_str(), "claude-cli" | "codex-cli"))
+                {
+                    let err = InvokeError::Overrides(
+                        "у агента нет секции [execution]: перекрытие effort / mcp.*.url \
+                         передать некуда"
+                            .to_string(),
+                    );
+                    self.fail_prepared_call(call_id, &req.agent, start, &err)
+                        .await;
+                    return Err(err);
+                }
+                None
+            }
         };
 
         let call_cwd = cli_hints.as_ref().and_then(|hints| hints.cwd.clone());
@@ -2150,10 +2292,27 @@ impl Runtime {
             model: model_name.clone(),
             system_prompt: rendered,
             user_input: String::new(),
-            temperature: agent.config.model.temperature.unwrap_or(0.7),
-            max_tokens: agent.config.model.max_tokens.unwrap_or(4096),
+            temperature: overrides
+                .temperature
+                .unwrap_or_else(|| agent.config.model.temperature.unwrap_or(0.7)),
+            max_tokens: overrides
+                .max_tokens
+                .unwrap_or_else(|| agent.config.model.max_tokens.unwrap_or(4096)),
             top_p: agent.config.model.top_p,
-            extra_body: agent.config.model.extra_body.clone(),
+            extra_body: {
+                let mut body = agent.config.model.extra_body.clone();
+                // Прямой провайдер: усилие уходит в тело запроса, если в
+                // аргументы CLI оно не легло.
+                if let Some(effort) = overrides.effort.as_deref() {
+                    if !effort_in_args {
+                        body.insert(
+                            "reasoning_effort".to_string(),
+                            Value::String(effort.to_string()),
+                        );
+                    }
+                }
+                body
+            },
             timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
             cli_hints,
             // Ходы пишутся в PG по мере выполнения. Пакетная запись в конце
@@ -2192,6 +2351,7 @@ impl Runtime {
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            overrides: overrides_json.clone(),
         })))
     }
 }
@@ -2398,6 +2558,7 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
         timeout_sec: _,
         call_key_guard: _call_key_guard,
         runs_dir,
+        overrides,
     } = ready;
 
     let llm_resp = match provider.complete(llm_req).await {
@@ -2566,6 +2727,7 @@ async fn execute_ready(pg: Arc<dyn Store>, ready: ReadyCall) -> Result<Completed
             call_id,
             parent_call_id,
             orchestration_depth,
+            overrides: overrides.and_then(|s| serde_json::from_str(&s).ok()),
         },
     };
     let incomplete_error = (!incomplete_reasons.is_empty()).then(|| incomplete_reasons.join("; "));
@@ -2940,6 +3102,7 @@ async fn read_call_outcome(
                 // ответа выставляем 0 — узел дерева оркестратору тут не нужен.
                 parent_call_id: row.parent_call_id,
                 orchestration_depth: 0,
+                overrides: row.overrides.clone(),
             },
         }
     };
@@ -3140,6 +3303,7 @@ fn build_response_from_cache(
     start: Instant,
     parent_call_id: Option<i64>,
     orchestration_depth: u32,
+    overrides: Option<Value>,
 ) -> Option<InvokeResponse> {
     let result: Value = serde_json::from_str(&entry.output_json).ok()?;
     let mut metadata: InvokeMetadata = serde_json::from_str(&entry.metadata_json).ok()?;
@@ -3149,6 +3313,7 @@ fn build_response_from_cache(
     metadata.variant = variant.to_string();
     metadata.parent_call_id = parent_call_id;
     metadata.orchestration_depth = orchestration_depth;
+    metadata.overrides = overrides;
     Some(InvokeResponse { result, metadata })
 }
 
@@ -3313,6 +3478,41 @@ fn inject_call_key_into_mcp_config(raw: &str, port: u16, key: &str) -> String {
     } else {
         raw.to_string()
     }
+}
+
+/// Переписать адрес (`url`) названных серверов в inline mcp_config агента.
+/// Меняется ТОЛЬКО поле `url` найденного сервера: остальные записи и поля
+/// (`headers`, stdio-серверы) остаются как есть. Имя сервера сверяется как есть
+/// и с заменой `-` на `_`. Сервер не найден или запись не объект — отказ.
+fn apply_mcp_url_overrides(raw: &str, urls: &BTreeMap<String, String>) -> Result<String, String> {
+    let Ok(mut value) = serde_json::from_str::<Value>(raw) else {
+        return Err("mcp_config агента не разобран как JSON".to_string());
+    };
+    let Some(servers) = value.get_mut("mcpServers").and_then(Value::as_object_mut) else {
+        return Err("в mcp_config агента нет объекта mcpServers".to_string());
+    };
+    for (server, url) in urls {
+        let key = if servers.contains_key(server) {
+            Some(server.clone())
+        } else {
+            servers
+                .keys()
+                .find(|name| name.replace('-', "_") == server.replace('-', "_"))
+                .cloned()
+        };
+        let Some(key) = key else {
+            return Err(format!(
+                "перекрытие mcp.*.url: сервер '{server}' не найден в mcp_config агента"
+            ));
+        };
+        let Some(config) = servers.get_mut(&key).and_then(Value::as_object_mut) else {
+            return Err(format!(
+                "перекрытие mcp.*.url: запись сервера '{server}' в mcp_config не объект"
+            ));
+        };
+        config.insert("url".to_string(), Value::String(url.clone()));
+    }
+    serde_json::to_string(&value).map_err(|e| format!("mcp_config не сериализован: {e}"))
 }
 
 /// Нормализованный JSON входа (sorted keys) + sha256 hex.
@@ -3603,13 +3803,14 @@ mod tests {
             call_id: 7,
             parent_call_id: None,
             orchestration_depth: 0,
+            overrides: None,
         };
         let entry = cache::CachedEntry {
             output_json: "{\"ok\":true}".into(),
             metadata_json: serde_json::to_string(&meta).unwrap(),
         };
         let resp =
-            build_response_from_cache("agent-new", "v2", &entry, Instant::now(), Some(42), 3)
+            build_response_from_cache("agent-new", "v2", &entry, Instant::now(), Some(42), 3, None)
                 .expect("должен восстановиться");
         assert!(resp.metadata.cached);
         assert_eq!(resp.metadata.agent, "agent-new");
@@ -3626,7 +3827,8 @@ mod tests {
             metadata_json: "тоже не json".into(),
         };
         assert!(
-            build_response_from_cache("a", "default", &entry, Instant::now(), None, 0).is_none()
+            build_response_from_cache("a", "default", &entry, Instant::now(), None, 0, None)
+                .is_none()
         );
     }
 
@@ -3808,6 +4010,7 @@ mod tests {
                 None,
                 None,
                 "test:1",
+                None,
             )
             .await
             .unwrap();
@@ -3880,6 +4083,7 @@ mod tests {
             orchestration_depth: 0,
             wait_sec: None,
             task_id: None,
+            overrides: None,
         }
     }
 
@@ -4549,6 +4753,7 @@ mod tests {
                 None,
                 None,
                 "test:status",
+                None,
             )
             .await
             .unwrap();
@@ -4608,6 +4813,7 @@ mod tests {
             input: &request.input,
             key_fields: &[],
             task_id: None,
+            overrides: "",
         });
         wait_for_cache(store.as_ref(), &first_key).await;
 
@@ -4639,6 +4845,7 @@ mod tests {
             input: &request.input,
             key_fields: &[],
             task_id: None,
+            overrides: "",
         });
         wait_for_cache(store.as_ref(), &first_key).await;
 
@@ -4695,6 +4902,7 @@ mod tests {
             input: &request.input,
             key_fields: &[],
             task_id: Some(task_id),
+            overrides: "",
         });
         wait_for_cache(store.as_ref(), &first_key).await;
 
@@ -4734,6 +4942,7 @@ mod tests {
             input: &request.input,
             key_fields: &[],
             task_id: None,
+            overrides: "",
         });
         wait_for_cache(store.as_ref(), &key).await;
 
@@ -4768,6 +4977,7 @@ mod tests {
             input: &request.input,
             key_fields: &[],
             task_id: None,
+            overrides: "",
         });
         wait_for_cache(store.as_ref(), &key).await;
         runtime.set_provider_env(ProviderEnv::default());
@@ -5246,12 +5456,22 @@ mod tests {
     fn agent_timeout_overrides_runtime_default() {
         let (runtime, _, _, dir) = cache_runtime("", "answer");
         runtime.set_default_timeout_sec(7);
-        assert_eq!(runtime.run_timeout(&cache_req()).unwrap(), 7);
+        assert_eq!(
+            runtime
+                .run_timeout(&cache_req(), &CallOverrides::default())
+                .unwrap(),
+            7
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         let (runtime, _, _, dir) = cache_runtime("[limits]\ntimeout_sec = 11", "answer");
         runtime.set_default_timeout_sec(7);
-        assert_eq!(runtime.run_timeout(&cache_req()).unwrap(), 11);
+        assert_eq!(
+            runtime
+                .run_timeout(&cache_req(), &CallOverrides::default())
+                .unwrap(),
+            11
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -31,6 +31,8 @@ pub struct CacheKeyParts<'a> {
     pub input: &'a Map<String, Value>,
     pub key_fields: &'a [String],
     pub task_id: Option<i64>,
+    /// Канонический JSON перекрытий вызова (`overrides`); пусто — перекрытий нет.
+    pub overrides: &'a str,
 }
 
 pub fn compute_key(parts: CacheKeyParts<'_>) -> String {
@@ -44,6 +46,7 @@ pub fn compute_key(parts: CacheKeyParts<'_>) -> String {
         input,
         key_fields,
         task_id,
+        overrides,
     } = parts;
     // Сортированное подмножество для детерминированности.
     let subset: BTreeMap<&str, &Value> = if key_fields.is_empty() {
@@ -60,7 +63,7 @@ pub fn compute_key(parts: CacheKeyParts<'_>) -> String {
     let prompt_hash = sha256_hex(prompt);
     let task_context_hash = sha256_hex(task_context);
     let payload = format!(
-        "{agent_name}|{variant}|{provider_name}|{model_name}|{prompt_hash}|{task_context_hash}|{task_id:?}|{raw}"
+        "{agent_name}|{variant}|{provider_name}|{model_name}|{prompt_hash}|{task_context_hash}|{task_id:?}|{overrides}|{raw}"
     );
     sha256_hex(&payload)
 }
@@ -118,6 +121,7 @@ mod tests {
             input,
             key_fields,
             task_id,
+            overrides: "",
         })
     }
 
@@ -220,6 +224,7 @@ mod tests {
                 input: &input,
                 key_fields: &[],
                 task_id: None,
+                overrides: "",
             })
         };
         let base = key_for("provider", "model", "prompt", "context");

@@ -384,6 +384,7 @@ def prepare(проект: Path, имя: str, язык: str) -> None:
     проверить_изоляцию()
     print(json.dumps({"work_dir": копия.as_posix(), "repo": ALIAS, "port": PORT},
                      ensure_ascii=False))
+    print(f"--code-index-url http://127.0.0.1:{PORT}/mcp")
 
 
 def apply(проект: Path, имя: str) -> None:

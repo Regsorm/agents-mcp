@@ -79,6 +79,9 @@ pub struct HistoryEntry {
     /// Экземпляр службы, создавший вызов (имя машины и порт). None — вызов
     /// старой сборки, которая колонку ещё не писала.
     pub instance: Option<String>,
+    /// Перекрытия вызова (канонический JSON); None — перекрытий не было или
+    /// текст колонки не разобран как JSON.
+    pub overrides: Option<serde_json::Value>,
 }
 
 /// Запись кеша ответов агента: сам ответ + metadata вызова (model, tokens, cost).
@@ -108,6 +111,8 @@ pub struct CallRow {
     pub latency_ms: Option<i64>,
     pub cached: bool,
     pub parent_call_id: Option<i64>,
+    /// Перекрытия вызова (канонический JSON); None — не было или не разобран.
+    pub overrides: Option<serde_json::Value>,
 }
 
 /// Финальный статус вызова. `running` сюда намеренно не входит: этот тип
@@ -388,6 +393,7 @@ pub trait Store: Send + Sync {
     /// вызова; метрики — нули, output/error/session_id — NULL. Возвращает id,
     /// который оркестратор прокидывает дочерним вызовам как `parent_call_id`.
     /// `instance` — экземпляр службы, создавший вызов.
+    /// `overrides` — канонический JSON перекрытий вызова или None.
     #[allow(clippy::too_many_arguments)]
     async fn insert_call_stub(
         &self,
@@ -399,6 +405,7 @@ pub trait Store: Send + Sync {
         parent_call_id: Option<i64>,
         task_id: Option<i64>,
         instance: &str,
+        overrides: Option<&str>,
     ) -> Result<i64>;
 
     /// Сохранить путь файла-итога фонового `agent_run` до старта задачи.

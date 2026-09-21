@@ -29,6 +29,8 @@ use super::{
 const SCHEMA: &str = include_str!("../../migrations_sqlite/001_init.sql");
 const RESULT_PATH_MIGRATION: &str =
     include_str!("../../migrations_sqlite/002_agent_calls_result_path.sql");
+const OVERRIDES_MIGRATION: &str =
+    include_str!("../../migrations_sqlite/003_agent_calls_overrides.sql");
 
 fn visible_error(error: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!("{error:#}")
@@ -139,6 +141,10 @@ fn ensure_agent_calls_columns(conn: &Connection) -> Result<()> {
     if !columns.iter().any(|c| c == "result_path") {
         conn.execute_batch(RESULT_PATH_MIGRATION)
             .context("task-store: добавление колонки agent_calls.result_path")?;
+    }
+    if !columns.iter().any(|c| c == "overrides") {
+        conn.execute_batch(OVERRIDES_MIGRATION)
+            .context("task-store: добавление колонки agent_calls.overrides")?;
     }
     Ok(())
 }
@@ -503,7 +509,7 @@ impl Store for SqliteStore {
                 .prepare(
                     "SELECT id, agent_name, variant, model_used, provider, \
                             tokens_in, tokens_out, cost_usd, latency_ms, \
-                            cached, created_at, error, parent_call_id, instance \
+                            cached, created_at, error, parent_call_id, instance, overrides \
                      FROM agent_calls \
                      WHERE (?1 IS NULL OR agent_name = ?1) \
                        AND created_at >= ?2 \
@@ -528,6 +534,9 @@ impl Store for SqliteStore {
                         error: r.get(11)?,
                         parent_call_id: r.get(12)?,
                         instance: r.get(13)?,
+                        overrides: r
+                            .get::<_, Option<String>>(14)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 })
                 .and_then(|m| m.collect::<rusqlite::Result<Vec<HistoryEntry>>>())
@@ -563,6 +572,7 @@ impl Store for SqliteStore {
         parent_call_id: Option<i64>,
         task_id: Option<i64>,
         instance: &str,
+        overrides: Option<&str>,
     ) -> Result<i64> {
         let agent = agent.to_string();
         let variant = variant.to_string();
@@ -570,14 +580,15 @@ impl Store for SqliteStore {
         let model_used = model_used.to_string();
         let provider = provider.to_string();
         let instance = instance.to_string();
+        let overrides = overrides.map(str::to_string);
         self.run(move |conn| {
             let now = chrono::Utc::now().timestamp();
             let id = conn
                 .query_row(
                     "INSERT INTO agent_calls \
                      (agent_name, variant, input_hash, model_used, provider, created_at, \
-                      parent_call_id, task_id, instance) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) RETURNING id",
+                      parent_call_id, task_id, instance, overrides) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) RETURNING id",
                     rusqlite::params![
                         agent,
                         variant,
@@ -587,7 +598,8 @@ impl Store for SqliteStore {
                         now,
                         parent_call_id,
                         task_id,
-                        instance
+                        instance,
+                        overrides
                     ],
                     |r| r.get::<_, i64>(0),
                 )
@@ -732,7 +744,7 @@ impl Store for SqliteStore {
             conn.query_row(
                 "SELECT status, output_json, error, agent_name, variant, model_used, \
                         provider, tokens_in, tokens_out, cost_usd, latency_ms, cached, \
-                        parent_call_id \
+                        parent_call_id, overrides \
                  FROM agent_calls WHERE id = ?1",
                 rusqlite::params![call_id],
                 |r| {
@@ -750,6 +762,9 @@ impl Store for SqliteStore {
                         latency_ms: r.get(10)?,
                         cached: r.get(11)?,
                         parent_call_id: r.get(12)?,
+                        overrides: r
+                            .get::<_, Option<String>>(13)?
+                            .and_then(|s| serde_json::from_str(&s).ok()),
                     })
                 },
             )
@@ -888,6 +903,7 @@ mod tests {
                 None,
                 None,
                 "test:1",
+                None,
             )
             .await
             .expect("insert_call_stub");
@@ -982,6 +998,7 @@ mod tests {
                 None,
                 None,
                 "test:1",
+                None,
             )
             .await
             .unwrap();
@@ -1027,6 +1044,7 @@ mod tests {
                 None,
                 None,
                 "test:1",
+                None,
             )
             .await
             .unwrap();
@@ -1435,6 +1453,7 @@ mod tests {
                 None,
                 None,
                 "test:1",
+                None,
             )
             .await
             .unwrap();
@@ -1453,6 +1472,7 @@ mod tests {
                 None,
                 None,
                 "test:1",
+                None,
             )
             .await
             .unwrap();
@@ -1512,19 +1532,19 @@ mod tests {
         let store = mem_store().await;
         let own_id = store
             .insert_call_stub(
-                "a-agent", "default", "h-a", "mock", "mock", None, None, "a:1",
+                "a-agent", "default", "h-a", "mock", "mock", None, None, "a:1", None,
             )
             .await
             .unwrap();
         let other_id = store
             .insert_call_stub(
-                "b-agent", "default", "h-b", "mock", "mock", None, None, "b:1",
+                "b-agent", "default", "h-b", "mock", "mock", None, None, "b:1", None,
             )
             .await
             .unwrap();
         let legacy_id = store
             .insert_call_stub(
-                "c-agent", "default", "h-c", "mock", "mock", None, None, "c:1",
+                "c-agent", "default", "h-c", "mock", "mock", None, None, "c:1", None,
             )
             .await
             .unwrap();
@@ -1628,7 +1648,7 @@ mod tests {
         let store = SqliteStore::open(&path).expect("open старой базы");
         let call_id = store
             .insert_call_stub(
-                "x-agent", "default", "h-x", "mock", "mock", None, None, "x:1",
+                "x-agent", "default", "h-x", "mock", "mock", None, None, "x:1", None,
             )
             .await
             .expect("insert_call_stub в обновлённую базу");

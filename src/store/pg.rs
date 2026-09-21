@@ -3,7 +3,7 @@
 //! Здесь лежит весь SQL службы: доска задач (`tasks`, `task_artifacts`,
 //! `task_events`), журнал вызовов (`agent_calls`, `agent_turns`), кеш ответов
 //! (`agent_cache`) и лог событий (`events`). Схема создаётся отдельно
-//! (`migrations_pg/001_task_store.sql` — `006_agent_calls_result_path.sql`),
+//! (`migrations_pg/001_task_store.sql` — `007_agent_calls_overrides.sql`),
 //! тут — клиент.
 //!
 //! Подключение — по DSN из конфига (`[storage].task_store_dsn`). Наружу
@@ -419,7 +419,7 @@ impl Store for PgStore {
             .query(
                 "SELECT id, agent_name, variant, model_used, provider, \
                         tokens_in, tokens_out, cost_usd, latency_ms, \
-                        cached, created_at, error, parent_call_id, instance \
+                        cached, created_at, error, parent_call_id, instance, overrides \
                  FROM agents_mcp.agent_calls \
                  WHERE ($1::text IS NULL OR agent_name = $1) \
                    AND created_at >= $2 \
@@ -446,6 +446,9 @@ impl Store for PgStore {
                 error: r.get(11),
                 parent_call_id: r.get(12),
                 instance: r.get(13),
+                overrides: r
+                    .get::<_, Option<String>>(14)
+                    .and_then(|s| serde_json::from_str(&s).ok()),
             })
             .collect())
     }
@@ -475,6 +478,7 @@ impl Store for PgStore {
         parent_call_id: Option<i64>,
         task_id: Option<i64>,
         instance: &str,
+        overrides: Option<&str>,
     ) -> Result<i64> {
         let now = chrono::Utc::now().timestamp();
         let client = self.client().await?;
@@ -482,8 +486,8 @@ impl Store for PgStore {
             .query_one(
                 "INSERT INTO agents_mcp.agent_calls \
                  (agent_name, variant, input_hash, model_used, provider, created_at, \
-                  parent_call_id, task_id, instance) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+                  parent_call_id, task_id, instance, overrides) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id",
                 &[
                     &agent,
                     &variant,
@@ -494,6 +498,7 @@ impl Store for PgStore {
                     &parent_call_id,
                     &task_id,
                     &instance,
+                    &overrides,
                 ],
             )
             .await
@@ -619,7 +624,7 @@ impl Store for PgStore {
             .query_opt(
                 "SELECT status, output_json, error, agent_name, variant, model_used, \
                         provider, tokens_in, tokens_out, cost_usd, latency_ms, cached, \
-                        parent_call_id \
+                        parent_call_id, overrides \
                  FROM agents_mcp.agent_calls WHERE id = $1",
                 &[&call_id],
             )
@@ -639,6 +644,9 @@ impl Store for PgStore {
             latency_ms: r.get(10),
             cached: r.get(11),
             parent_call_id: r.get(12),
+            overrides: r
+                .get::<_, Option<String>>(13)
+                .and_then(|s| serde_json::from_str(&s).ok()),
         }))
     }
 

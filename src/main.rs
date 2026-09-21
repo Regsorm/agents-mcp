@@ -16,6 +16,7 @@ mod config;
 mod errors;
 mod health;
 mod log_layer;
+mod overrides;
 mod pid_lock;
 mod proc_tree;
 mod providers;
@@ -255,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.agents.default_timeout_sec,
     ));
     runtime_inner.set_provider_env(provider_env.clone());
+    runtime_inner.set_allowed_mcp_urls(cfg.agents.allowed_mcp_urls.clone());
 
     // Перечитка главного конфига без перезапуска: применяет изменившееся и по
     // инструменту config_reload, и по сохранению файла конфига. Наблюдатель
