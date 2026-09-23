@@ -176,6 +176,14 @@ indexer is taken from the `CODE_INDEX_EXE` variable; otherwise, `bsl-indexer` is
 searched for in PATH. Shared-index configurations for the isolation check are
 taken from `CODE_INDEX_MAIN_HOME` (the indexer directory by default).
 
+If the [code-index-guard](https://github.com/Regsorm/code-index-mcp) hook is
+installed on the machine, `prepare` adds the copy directory as a `[[local]]`
+section to its configuration (`~/.claude/hooks/code-index-guard.toml`, overridden
+by `CODE_INDEX_GUARD_CONFIG`), and `remove` takes that section out. The copy is
+then readable through its own index only: plain `Read`, `Grep`, `cat`/`grep`/`ls`
+over it are rejected by the hook. Nothing is added to the indexer's shared
+`daemon.toml`, and other sections of the configuration are left untouched.
+
 Only the call result file, service log, and call database remain locally.
 
 ## Installation

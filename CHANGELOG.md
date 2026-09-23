@@ -5,6 +5,18 @@
 Формат — [Keep a Changelog 1.0.0](https://keepachangelog.com/ru/1.0.0/),
 версионирование — [SemVer](https://semver.org/lang/ru/).
 
+## [Не выпущено]
+
+### Добавлено
+
+- **`scripts/clean_copy.py`: копия под запретом обычного чтения.** `prepare`
+  дописывает каталог копии секцией `[[local]]` в конфиг хука
+  `code-index-guard` (`~/.claude/hooks/code-index-guard.toml`,
+  переопределяется переменной `CODE_INDEX_GUARD_CONFIG`), `remove` её убирает.
+  Копия читается только через свой индекс: `Read`, `Grep`, `cat`/`grep`/`ls`
+  по ней хук отклоняет. В общий `daemon.toml` индексатора ничего не
+  добавляется, чужие секции конфига не трогаются.
+
 ## [1.1.0] — 2026-09-21
 
 ### Добавлено
