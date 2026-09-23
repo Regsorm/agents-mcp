@@ -347,10 +347,12 @@ def секция_охраны(имя: str, копия: Path, алиас: str) ->
 
 
 def без_секции(текст: str, имя: str) -> str:
-    """Тот же конфиг без секции этой копии; чужие секции остаются как есть."""
+    """Тот же конфиг без секции этой копии; чужие секции остаются как есть.
+    Уходит и пустая строка перед секцией — её добавляет правка_конфига_хука,
+    иначе prepare → remove оставлял бы файл на строку длиннее."""
     образец = re.compile(
-        rf"^{re.escape(МЕТКА_НАЧАЛА)} {re.escape(имя)}$.*?"
-        rf"^{re.escape(МЕТКА_КОНЦА)} {re.escape(имя)}$\r?\n?",
+        rf"(?:(?<=\n)\r?\n)?^{re.escape(МЕТКА_НАЧАЛА)} {re.escape(имя)}\r?$.*?"
+        rf"^{re.escape(МЕТКА_КОНЦА)} {re.escape(имя)}\r?$\n?",
         re.MULTILINE | re.DOTALL)
     return образец.sub("", текст)
 
@@ -372,22 +374,26 @@ def правка_конфига_хука(имя: str, секция: str | None) 
     else:
         raise SystemExit(f"конфиг хука занят: замок {замок} держит другая правка")
     try:
+        # Концы строк файла сохраняются как были (newline=""): текстовый режим
+        # Windows превращал бы LF в CRLF при каждой правке.
         try:
-            текст = КОНФИГ_ХУКА.read_text(encoding="utf-8")
+            with КОНФИГ_ХУКА.open(encoding="utf-8", newline="") as файл:
+                текст = файл.read()
         except FileNotFoundError:
             if секция is None:
                 return False
             текст = ("# Конфиг хука code-index-guard.\n"
                      "# Секции ниже добавляет clean_copy.py — по одной на чистую копию.\n")
+        перевод = "\r\n" if "\r\n" in текст else "\n"
         новый = без_секции(текст, имя)
         if секция is not None:
             if новый and not новый.endswith("\n"):
-                новый += "\n"
-            новый += "\n" + секция
+                новый += перевод
+            новый += перевод + секция.replace("\n", перевод)
         if новый == текст:
             return False
         временный = КОНФИГ_ХУКА.with_name(КОНФИГ_ХУКА.name + ".tmp")
-        временный.write_text(новый, encoding="utf-8")
+        временный.write_text(новый, encoding="utf-8", newline="")
         os.replace(временный, КОНФИГ_ХУКА)
         return True
     finally:
