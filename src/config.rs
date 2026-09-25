@@ -40,12 +40,20 @@ pub struct Config {
 pub struct FsConfig {
     #[serde(default = "default_fs_roots")]
     pub allowed_roots: Vec<PathBuf>,
+    /// Путь к программе гарда индекса; без него проверка чтения выключена.
+    #[serde(default)]
+    pub read_guard: Option<PathBuf>,
+    /// Префикс MCP-инструментов индекса для аргумента `--mcp-prefix` гарда.
+    #[serde(default)]
+    pub read_guard_mcp_prefix: Option<String>,
 }
 
 impl Default for FsConfig {
     fn default() -> Self {
         Self {
             allowed_roots: default_fs_roots(),
+            read_guard: None,
+            read_guard_mcp_prefix: None,
         }
     }
 }

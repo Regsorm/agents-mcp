@@ -377,6 +377,38 @@ The chain script has a short option for the same URL:
 python scripts/code_chain.py --work-dir C:/Project --task "Fix the defect" --code-index-url http://127.0.0.1:8037/mcp
 ```
 
+### Reading through the index (`[fs] read_guard`)
+
+An agent that has the code-index `read_file` tool can still read project files
+through `fs_read_file` — whole, bypassing the index, which costs noticeably more
+tokens. The optional `read_guard` setting makes the service ask an external
+guard program before each such read and follow its answer: a denial comes back to
+the agent as an error with a hint about the index tool; otherwise the file is read
+as usual.
+
+```toml
+[fs]
+read_guard = "C:/tools/code-index-guard.exe"
+# how the guard names index tools in its hint (its --mcp-prefix flag)
+read_guard_mcp_prefix = "mcp__code-index__"
+```
+
+- The check applies only to calls made by the service's agents, and only to
+  agents with the index `read_file` tool (for Codex agents — with the `code_index`
+  server in `extra_args`). External clients and agents without the index read as
+  before.
+- The guard is any program speaking the Claude Code `PreToolUse` hook contract:
+  input `{"tool_name": "Read", "tool_input": {"file_path": …}, "cwd": …}`, output a
+  `deny`/`allow` decision or nothing. A ready one is `code-index-guard` from
+  [code-index](https://github.com/Regsorm/code-index-mcp/tree/main/crates/code-index-guard):
+  it denies only files the index serves up to date and lets new or unindexed
+  files through.
+- If the guard is missing, crashes, does not answer within 5 s or returns garbage,
+  the file is read and a warning goes to the service log.
+- Codex agents get the call key as a header of the `agents` server
+  (`http_headers`), so their `fs_read_file` is likewise confined to the task's
+  working directory and passes the same check.
+
 ### Secrets in configuration
 
 HTTP provider keys are still specified by environment variable name in
@@ -449,7 +481,8 @@ tool.
 Applied at runtime: `[storage] runs_dir`; `[agents]` `force_provider` /
 `force_model`, `default_timeout_sec`, `agents_dir`, and `hot_reload`; all of `[providers.*]` (a provider
 whose settings have not changed remains the same — with its connections and
-semaphore); `[skills]` `rag_query_url`; `[fs] allowed_roots`.
+semaphore); `[skills]` `rag_query_url`; `[fs] allowed_roots`, `read_guard`, and
+`read_guard_mcp_prefix`.
 
 Require a restart and are returned in the `restart_required` list: all of
 `[server]` (host, port, allowed_hosts, instance) and `[storage]` `log_dir`,

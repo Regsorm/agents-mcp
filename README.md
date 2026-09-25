@@ -376,6 +376,37 @@ max_concurrent = 2
 python scripts/code_chain.py --work-dir C:/Project --task "Исправить дефект" --code-index-url http://127.0.0.1:8037/mcp
 ```
 
+### Чтение через индекс (`[fs] read_guard`)
+
+Агент, у которого есть инструмент `read_file` code-index, может читать файлы
+проекта и через `fs_read_file` — целиком, мимо индекса, и это заметно дороже по
+токенам. Необязательная настройка `read_guard` заставляет службу перед каждым
+таким чтением спросить внешнюю программу-гард и исполнить её ответ: отказ
+возвращается агенту ошибкой с подсказкой инструмента индекса, иначе файл
+читается как обычно.
+
+```toml
+[fs]
+read_guard = "C:/tools/code-index-guard.exe"
+# как гард назовёт инструменты индекса в подсказке (его ключ --mcp-prefix)
+read_guard_mcp_prefix = "mcp__code-index__"
+```
+
+- Проверка идёт только для вызовов агентов службы и только у агентов с
+  инструментом `read_file` индекса (у агентов на Codex — с сервером `code_index`
+  в `extra_args`). Внешние клиенты и агенты без индекса читают как раньше.
+- Гард — любая программа с договором хуков `PreToolUse` Claude Code: на вход
+  `{"tool_name": "Read", "tool_input": {"file_path": …}, "cwd": …}`, на выход
+  решение `deny`/`allow` или пустой вывод. Готовый — `code-index-guard` из
+  [code-index](https://github.com/Regsorm/code-index-mcp/tree/main/crates/code-index-guard):
+  отклоняет только файлы, которые индекс отдаёт в актуальном виде, новый или
+  неиндексированный файл пропускает.
+- Гард не найден, упал, не ответил за 5 с или вернул мусор — файл читается,
+  в журнал службы уходит предупреждение.
+- Агентам на Codex служба передаёт ключ вызова заголовком сервера `agents`
+  (`http_headers`), поэтому их `fs_read_file` так же заперт в рабочем каталоге
+  задания и проходит ту же проверку.
+
 ### Секреты в настройках
 
 Ключи HTTP-провайдеров по-прежнему задаются именем переменной в `api_key_env`.
@@ -442,7 +473,8 @@ python scripts/code_chain.py --work-dir C:/Project --task "Исправить д
 Применяются на лету: `[storage] runs_dir`; `[agents]` `force_provider` /
 `force_model`, `default_timeout_sec`, `agents_dir` и `hot_reload`; весь `[providers.*]` (провайдер с
 неизменившимися настройками остаётся тем же — со своими соединениями и
-семафором); `[skills]` `rag_query_url`; `[fs] allowed_roots`.
+семафором); `[skills]` `rag_query_url`; `[fs] allowed_roots`, `read_guard` и
+`read_guard_mcp_prefix`.
 
 Требуют перезапуска и приходят в ответе списком `restart_required`: весь
 `[server]` (host, port, allowed_hosts, instance) и `[storage]` `log_dir`,

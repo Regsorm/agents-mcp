@@ -44,6 +44,8 @@ pub(crate) struct CallScope {
     pub allowed_roots: Option<Vec<PathBuf>>,
     pub parent_call_id: Option<i64>,
     pub orchestration_depth: u32,
+    /// Агенту доступен code-index, поэтому чтение через fs_read_file проверяет гард.
+    pub reads_code_index: bool,
 }
 
 type CallScopes = Arc<std::sync::Mutex<HashMap<String, CallScope>>>;
@@ -821,6 +823,7 @@ impl Runtime {
         allowed_roots: Option<Vec<PathBuf>>,
         parent_call_id: Option<i64>,
         orchestration_depth: u32,
+        reads_code_index: bool,
     ) -> (String, CallKeyGuard) {
         let key = uuid::Uuid::new_v4().to_string();
         self.call_scopes
@@ -834,6 +837,7 @@ impl Runtime {
                     allowed_roots,
                     parent_call_id,
                     orchestration_depth,
+                    reads_code_index,
                 },
             );
         let guard = CallKeyGuard {
@@ -2269,6 +2273,7 @@ impl Runtime {
         };
 
         let call_cwd = cli_hints.as_ref().and_then(|hints| hints.cwd.clone());
+        let reads_code_index = cli_hints.as_ref().is_some_and(agent_reads_code_index);
         let agent_roots = agent
             .config
             .execution
@@ -2280,11 +2285,15 @@ impl Runtime {
             agent_roots,
             req.parent_call_id,
             req.orchestration_depth,
+            reads_code_index,
         );
         let own_mcp_port = *self.own_mcp_port.read().unwrap_or_else(|e| e.into_inner());
         if let (Some(hints), Some(port)) = (cli_hints.as_mut(), own_mcp_port) {
             if let Some(raw) = hints.mcp_config.as_deref() {
                 hints.mcp_config = Some(inject_call_key_into_mcp_config(raw, port, &call_key));
+            }
+            if provider_name == "codex-cli" {
+                inject_call_key_into_codex_args(&mut hints.extra_args, port, &call_key);
             }
         }
 
@@ -3444,6 +3453,48 @@ fn is_own_mcp_url(raw: &str, port: u16) -> bool {
         && url.path() == "/mcp"
 }
 
+fn agent_reads_code_index(hints: &ClaudeCliHints) -> bool {
+    hints
+        .allowed_tools
+        .iter()
+        .any(|tool| tool == "mcp__code-index__read_file")
+        || crate::overrides::mcp_servers_of_extra_args(&hints.extra_args)
+            .iter()
+            .any(|name| name.replace('-', "_") == "code_index")
+}
+
+fn inject_call_key_into_codex_args(extra_args: &mut Vec<String>, port: u16, key: &str) {
+    let mut own_servers: Vec<String> = Vec::new();
+    for arg in extra_args.iter() {
+        let Some(setting) = arg.strip_prefix("mcp_servers.") else {
+            continue;
+        };
+        let Some((name, raw_url)) = setting.split_once(".url=") else {
+            continue;
+        };
+        if name.is_empty() || name.contains('.') {
+            continue;
+        }
+        let url = raw_url.trim().trim_matches(|ch| ch == '"' || ch == '\'');
+        if is_own_mcp_url(url, port) && !own_servers.iter().any(|server| server == name) {
+            own_servers.push(name.to_string());
+        }
+    }
+    for name in own_servers {
+        let header = format!("mcp_servers.{name}.http_headers.{CALL_KEY_HEADER}=");
+        let mut i = 0;
+        while i + 1 < extra_args.len() {
+            if extra_args[i] == "-c" && extra_args[i + 1].starts_with(&header) {
+                extra_args.drain(i..i + 2);
+            } else {
+                i += 1;
+            }
+        }
+        extra_args.push("-c".to_string());
+        extra_args.push(format!("{header}\"{key}\""));
+    }
+}
+
 /// Добавить ключ вызова только в записи, ведущие на собственный HTTP `/mcp`.
 /// Алиас записи намеренно не рассматривается: доверяем адресу, а не имени.
 fn inject_call_key_into_mcp_config(raw: &str, port: u16, key: &str) -> String {
@@ -3535,6 +3586,71 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn detects_code_index_access() {
+        let mut hints = ClaudeCliHints::default();
+        hints
+            .allowed_tools
+            .push("mcp__agents__fs_read_file".to_string());
+        assert!(!agent_reads_code_index(&hints));
+        hints
+            .allowed_tools
+            .push("mcp__code-index__read_file".to_string());
+        assert!(agent_reads_code_index(&hints));
+
+        hints.allowed_tools.clear();
+        hints.extra_args = vec![
+            "-c".to_string(),
+            "mcp_servers.code_index.url=\"http://127.0.0.1:8011/mcp\"".to_string(),
+        ];
+        assert!(agent_reads_code_index(&hints));
+        hints.extra_args[1] =
+            "mcp_servers.code-index.url=\"http://127.0.0.1:8011/mcp\"".to_string();
+        assert!(agent_reads_code_index(&hints));
+        hints.extra_args[1] = "mcp_servers.agents.url=\"http://127.0.0.1:8025/mcp\"".to_string();
+        assert!(!agent_reads_code_index(&hints));
+    }
+
+    #[test]
+    fn injects_and_replaces_codex_call_key() {
+        let mut args = vec![
+            "-c".to_string(),
+            "mcp_servers.agents.url=\"http://127.0.0.1:8025/mcp\"".to_string(),
+        ];
+        inject_call_key_into_codex_args(&mut args, 8025, "k");
+        let header = "mcp_servers.agents.http_headers.x-agents-mcp-call=\"k\"";
+        assert_eq!(args[2], "-c");
+        assert_eq!(args[3], header);
+
+        inject_call_key_into_codex_args(&mut args, 8025, "next");
+        assert_eq!(args.len(), 4);
+        assert_eq!(
+            args[3],
+            "mcp_servers.agents.http_headers.x-agents-mcp-call=\"next\""
+        );
+
+        let mut svc = vec![
+            "-c".to_string(),
+            "mcp_servers.svc.url=\"http://127.0.0.1:8025/mcp\"".to_string(),
+        ];
+        inject_call_key_into_codex_args(&mut svc, 8025, "k");
+        assert_eq!(
+            svc[3],
+            "mcp_servers.svc.http_headers.x-agents-mcp-call=\"k\""
+        );
+
+        let mut foreign = vec![
+            "-c".to_string(),
+            "mcp_servers.agents.url=\"http://127.0.0.1:8026/mcp\"".to_string(),
+        ];
+        let before = foreign.clone();
+        inject_call_key_into_codex_args(&mut foreign, 8025, "k");
+        assert_eq!(foreign, before);
+        let mut empty = Vec::new();
+        inject_call_key_into_codex_args(&mut empty, 8025, "k");
+        assert!(empty.is_empty());
+    }
+
     fn obj(v: Value) -> Map<String, Value> {
         v.as_object().expect("ожидался JSON-объект").clone()
     }
@@ -3574,7 +3690,7 @@ mod tests {
     fn call_key_guard_removes_context() {
         let (runtime, _, dir) = test_runtime("call-key", "ok");
         let cwd = dir.join("work");
-        let (key, guard) = runtime.issue_call_key(41, Some(cwd.clone()), None, Some(17), 3);
+        let (key, guard) = runtime.issue_call_key(41, Some(cwd.clone()), None, Some(17), 3, false);
         let scope = runtime.call_scope(&key).expect("ключ зарегистрирован");
         assert_eq!(scope.call_id, 41);
         assert_eq!(scope.cwd.as_deref(), Some(cwd.as_path()));

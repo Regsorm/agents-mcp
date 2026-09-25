@@ -34,6 +34,7 @@ use crate::providers::{
     openrouter::{OpenRouterOptions, OpenRouterProvider},
     LlmProvider,
 };
+use crate::read_guard::ReadGuard;
 use crate::registry::Registry;
 use crate::runtime::{Runtime, SharedOverride};
 use crate::watcher;
@@ -785,6 +786,7 @@ pub struct ConfigReloader {
     runtime: Arc<Runtime>,
     force_override: SharedOverride,
     fs_roots: Arc<std::sync::RwLock<Vec<PathBuf>>>,
+    read_guard: Arc<std::sync::RwLock<Option<ReadGuard>>>,
     service_paths: Arc<std::sync::RwLock<ServicePaths>>,
     agents_watcher: std::sync::Mutex<Option<notify::RecommendedWatcher>>,
 }
@@ -809,6 +811,7 @@ impl ConfigReloader {
     ) -> Arc<Self> {
         runtime.set_provider_set(providers.providers.clone(), providers.statuses.clone());
         let fs_roots = Arc::new(std::sync::RwLock::new(cfg.fs.allowed_roots.clone()));
+        let read_guard = Arc::new(std::sync::RwLock::new(ReadGuard::from_config(&cfg.fs)));
         let service_paths = Arc::new(std::sync::RwLock::new(ServicePaths::from_config(
             config_path.as_deref(),
             &cfg,
@@ -825,6 +828,7 @@ impl ConfigReloader {
             runtime,
             force_override,
             fs_roots,
+            read_guard,
             service_paths,
             agents_watcher: std::sync::Mutex::new(None),
         });
@@ -836,6 +840,10 @@ impl ConfigReloader {
     /// `[fs] allowed_roots` подменяет его содержимое на лету.
     pub fn fs_roots(&self) -> Arc<std::sync::RwLock<Vec<PathBuf>>> {
         self.fs_roots.clone()
+    }
+
+    pub(crate) fn read_guard(&self) -> Arc<std::sync::RwLock<Option<ReadGuard>>> {
+        self.read_guard.clone()
     }
 
     /// Общий с файловыми инструментами запретный список служебных путей.
@@ -1114,14 +1122,27 @@ impl ConfigReloader {
 
         // ── [fs] allowed_roots ──────────────────────────────────────────────
         if new.fs != st.cfg.fs {
+            let guard_changed =
+                ReadGuard::from_config(&new.fs) != ReadGuard::from_config(&st.cfg.fs);
             {
                 let mut roots = self.fs_roots.write().unwrap_or_else(|e| e.into_inner());
                 *roots = new.fs.allowed_roots.clone();
+            }
+            {
+                let mut guard = self.read_guard.write().unwrap_or_else(|e| e.into_inner());
+                *guard = ReadGuard::from_config(&new.fs);
             }
             report.applied.push(format!(
                 "[fs] allowed_roots: {}",
                 join_paths(&new.fs.allowed_roots)
             ));
+            if guard_changed {
+                let guard = match &new.fs.read_guard {
+                    Some(path) => path.display().to_string(),
+                    None => "выключен".to_string(),
+                };
+                report.applied.push(format!("[fs] read_guard: {guard}"));
+            }
         }
 
         // ── Что применяется только перезапуском службы ──────────────────────

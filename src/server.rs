@@ -20,6 +20,9 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::health::{HealthResponse, ProviderStatus};
+use crate::read_guard::{
+    ask_read_guard, read_guard_applies, GuardVerdict, ReadGuard, READ_GUARD_TIMEOUT,
+};
 use crate::registry::Registry;
 use crate::runtime::{
     CallScope, CancelOutcome, DrainStatus, InvokeOutcome, InvokeRequest, Runtime, StartedJob,
@@ -47,6 +50,7 @@ pub struct AgentsMcpServer {
     /// Разрешённые корни для файловых инструментов fs_* (из config [fs]).
     /// За RwLock: перечитка главного конфига подменяет список на лету.
     fs_roots: Arc<std::sync::RwLock<Vec<PathBuf>>>,
+    read_guard: Arc<std::sync::RwLock<Option<ReadGuard>>>,
     /// Служебные пути защищены независимо от ширины allowed_roots.
     service_paths: Arc<std::sync::RwLock<crate::reload::ServicePaths>>,
     /// Перечитка главного конфига без перезапуска — бэкенд инструмента config_reload.
@@ -63,12 +67,14 @@ impl AgentsMcpServer {
     ) -> Self {
         // Корни берём у перечитки: она же подменит их при смене [fs] allowed_roots.
         let fs_roots = reloader.fs_roots();
+        let read_guard = reloader.read_guard();
         let service_paths = reloader.service_paths();
         Self {
             started_at,
             registry,
             runtime,
             fs_roots,
+            read_guard,
             service_paths,
             reloader,
             tool_router: Self::tool_router(),
@@ -1203,6 +1209,32 @@ impl AgentsMcpServer {
             Ok(x) => x,
             Err(e) => return err_json(&e),
         };
+        let scope = self.request_call_scope(&extensions).ok().flatten();
+        let guard = self
+            .read_guard
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if read_guard_applies(scope.as_ref(), guard.as_ref()) {
+            match ask_read_guard(
+                guard.as_ref().expect("гард проверен выше"),
+                &p.path,
+                scope_dir.as_deref(),
+                READ_GUARD_TIMEOUT,
+            )
+            .await
+            {
+                GuardVerdict::Deny(reason) => return err_json(&reason),
+                GuardVerdict::Pass => {}
+                GuardVerdict::Broken(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        path = %p.path,
+                        "гард индекса не ответил, читаю без него"
+                    );
+                }
+            }
+        }
         match fs_read_file_content(&path) {
             Ok(content) => {
                 serde_json::json!({"ok": true, "path": p.path, "content": content}).to_string()
@@ -2103,6 +2135,7 @@ mod fs_safe_path_tests {
             allowed_roots: None,
             parent_call_id: None,
             orchestration_depth: 0,
+            reads_code_index: false,
         };
         let effective = effective_fs_scope(Some(trusted), Some(&path_text(&sibling)))
             .expect("ключ задаёт рабочий каталог")
@@ -2136,6 +2169,7 @@ mod fs_safe_path_tests {
             allowed_roots: None,
             parent_call_id: None,
             orchestration_depth: 0,
+            reads_code_index: false,
         };
         assert!(effective_fs_scope(Some(no_cwd), Some("C:/подложный")).is_err());
         assert_eq!(effective_fs_scope(None, None).unwrap(), None);
@@ -2149,6 +2183,7 @@ mod fs_safe_path_tests {
             allowed_roots: None,
             parent_call_id: Some(12),
             orchestration_depth: 2,
+            reads_code_index: false,
         };
         assert_eq!(
             effective_child_lineage(Some(&scope), Some(999), 0),
@@ -2172,6 +2207,7 @@ mod fs_safe_path_tests {
             allowed_roots: Some(vec![agent_root.clone()]),
             parent_call_id: None,
             orchestration_depth: 0,
+            reads_code_index: false,
         };
         let effective = effective_fs_scope(Some(trusted.clone()), None)
             .expect("ключ задаёт рабочий каталог")
@@ -2203,6 +2239,7 @@ mod fs_safe_path_tests {
             allowed_roots: None,
             parent_call_id: None,
             orchestration_depth: 0,
+            reads_code_index: false,
         };
         assert!(
             fs_safe_path(
