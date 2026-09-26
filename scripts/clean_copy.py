@@ -14,7 +14,7 @@ health и в ошибке «неизвестный алиас» — а всё э
   <AGENT_WORK_DIR>/_indexes/<имя> на 127.0.0.1:<порт> с единственным
   репозиторием под указанным алиасом — демон следит за копией, так что правки
   агента видны в индексе сразу; затем проверка, что в ответах индекса нет чужих
-  путей. Порт и алиас обязательны и у каждой копии свои, поэтому копии разных
+  путей. Порт (можно ``--port auto``) и алиас обязательны и у каждой копии свои, поэтому копии разных
   задач живут одновременно, каждая со своим индексом. Напоследок каталог копии
   дописывается секцией ``[[local]]`` в конфиг хука ``code-index-guard``: обычное
   чтение копии (Read, Grep, cat/grep/ls в оболочке) хук отклоняет и отправляет в
@@ -52,7 +52,7 @@ health и в ошибке «неизвестный алиас» — а всё э
 
 Запуск::
 
-    python scripts/clean_copy.py prepare C:/Projects/my-app задача1 --port 8037 --alias work --language python --files "src/*"
+    python scripts/clean_copy.py prepare C:/Projects/my-app задача1 --port auto --alias work --language python --files "src/*"
     python scripts/clean_copy.py commit  C:/Projects/my-app задача1 --message "Правка по задаче"
     python scripts/clean_copy.py list
     python scripts/clean_copy.py apply   C:/Projects/my-app задача1
@@ -96,6 +96,7 @@ MAIN_HOME = Path(os.environ.get("CODE_INDEX_MAIN_HOME") or (Path(EXE).parent if 
 # в исходниках code-index).
 НЕ_ГОТОВ = ("not_started", "indexing", "error", "daemon_offline", "unknown_repo")
 CREATE_NO_WINDOW = 0x08000000
+ПОПЫТОК_ПОРТА = 3
 
 
 def git(*args: str, cwd: Path | str, env: dict | None = None) -> str:
@@ -438,6 +439,32 @@ def проверить_порт(порт: int | None) -> int:
     return порт
 
 
+def порт_от_системы() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as сокет:
+        сокет.bind(("127.0.0.1", 0))
+        return сокет.getsockname()[1]
+
+
+def занятые_порты_копий() -> set[int]:
+    порты = set()
+    for файл in каталог_домов().glob("*/copy.json"):
+        try:
+            порт = прочитать_copy(файл.parent).get("port")
+            if isinstance(порт, int):
+                порты.add(порт)
+        except (OSError, ValueError, UnicodeError):
+            pass
+    return порты
+
+
+def свободный_порт() -> int:
+    for _ in range(20):
+        порт = порт_от_системы()
+        if порт not in занятые_порты_копий():
+            return порт
+    raise SystemExit("не удалось выбрать свободный порт за 20 попыток")
+
+
 def проверить_алиас(алиас: str | None) -> str:
     if not алиас or not re.fullmatch(r"[A-Za-z0-9_-]+", алиас):
         raise SystemExit(f"недопустимый --alias {алиас!r}: только буквы, цифры, _ и -")
@@ -562,7 +589,7 @@ def прочитать_copy(дом_копии: Path) -> dict:
     return данные
 
 
-def prepare(проект: Path, имя: str, язык: str, порт: int, алиас: str,
+def prepare(проект: Path, имя: str, язык: str, порт: int | None, алиас: str,
             база: str = "HEAD", файлы: list[str] | None = None) -> None:
     копия = путь_копии(имя)
     дом_копии = дом(имя)
@@ -570,9 +597,13 @@ def prepare(проект: Path, имя: str, язык: str, порт: int, ал�
         raise SystemExit(f"копия {копия} уже есть — сначала remove")
     if дом_копии.exists():
         raise SystemExit(f"дом индекса {дом_копии} уже есть — сначала remove")
-    проверить_порт(порт)
+    авто = порт is None
+    if авто:
+        порт = свободный_порт()
+    else:
+        проверить_порт(порт)
     проверить_алиас(алиас)
-    if порт_занят(порт):
+    if not авто and порт_занят(порт):
         raise SystemExit(f"порт {порт} занят — возьмите другой --port")
     ветка = f"agent/{имя}"
     if not имя_ветки_годно(проект, ветка):
@@ -588,7 +619,7 @@ def prepare(проект: Path, имя: str, язык: str, порт: int, ал�
     # Сведения о копии пишутся до запуска индекса: list и remove должны видеть
     # и копию с упавшим индексом.
     дом_копии.mkdir(parents=True, exist_ok=True)
-    (дом_копии / "copy.json").write_text(json.dumps({
+    сведения = {
         "name": имя,
         "project": проект.resolve().as_posix(),
         "copy": копия.as_posix(),
@@ -598,8 +629,20 @@ def prepare(проект: Path, имя: str, язык: str, порт: int, ал�
         "alias": алиас,
         "language": язык,
         "files": файлы,
-    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    запустить_индекс(копия, дом_копии, язык, порт, алиас)
+    }
+    for попытка in range(ПОПЫТОК_ПОРТА):
+        (дом_копии / "copy.json").write_text(
+            json.dumps(сведения, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        try:
+            запустить_индекс(копия, дом_копии, язык, порт, алиас)
+            break
+        except SystemExit:
+            if not авто or попытка == ПОПЫТОК_ПОРТА - 1 or not порт_занят(порт):
+                raise
+            новый_порт = свободный_порт()
+            print(f"[индекс] порт {порт} перехвачен — беру {новый_порт}")
+            порт = новый_порт
+            сведения["port"] = порт
     проверить_изоляцию(дом_копии, порт, алиас)
     под_охрану(имя, копия, алиас)
     адрес = f"http://127.0.0.1:{порт}/mcp"
@@ -800,7 +843,7 @@ def main() -> None:
     разбор.add_argument("имя", nargs="?", help="имя копии — каталог в AGENT_WORK_DIR")
     разбор.add_argument("--language", default="python",
                         help="язык индекса копии (как в daemon.toml)")
-    разбор.add_argument("--port", type=int, help="порт индекса копии, целое 1024..65535")
+    разбор.add_argument("--port", type=str, help="порт индекса копии, целое 1024..65535 или auto")
     разбор.add_argument("--alias", help="алиас репозитория копии в индексе")
     разбор.add_argument("--base", default="HEAD",
                         help="коммит или ветка проекта — начало ветки agent/<имя>")
@@ -834,7 +877,15 @@ def main() -> None:
         raise SystemExit("не найден индексатор: задайте CODE_INDEX_EXE "
                          "или добавьте bsl-indexer в PATH")
     if a.команда == "prepare":
-        prepare(a.проект, a.имя, a.language, a.port, a.alias, a.base,
+        if a.port == "auto":
+            порт = None
+        else:
+            try:
+                порт = int(a.port)
+            except ValueError:
+                raise SystemExit(f"недопустимый --port {a.port!r}")
+            проверить_порт(порт)
+        prepare(a.проект, a.имя, a.language, порт, a.alias, a.base,
                 разобрать_файлы(a.files))
     elif a.команда == "commit":
         commit(a.проект, a.имя, a.message)
