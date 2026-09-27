@@ -10,7 +10,10 @@ health и в ошибке «неизвестный алиас» — а всё э
 
 * ``prepare`` — git worktree проекта в <AGENT_WORK_DIR>/<имя> на новой ветке
   ``agent/<имя>`` от указанного коммита (в копии только файлы под контролем
-  версий), отдельные демон и ``bsl-indexer serve`` со своим CODE_INDEX_HOME в
+  версий). Копию, перенос в неё базы индекса проекта и конфиги индекса копии
+  делает программа ``code-index-copy`` из code-index (режим ``--worktree``): демон
+  копии при запуске только сверяет файлы с базой и не строит индекс заново. Далее
+  отдельные демон и ``bsl-indexer serve`` со своим CODE_INDEX_HOME в
   <AGENT_WORK_DIR>/_indexes/<имя> на 127.0.0.1:<порт> с единственным
   репозиторием под указанным алиасом — демон следит за копией, так что правки
   агента видны в индексе сразу; затем проверка, что в ответах индекса нет чужих
@@ -44,6 +47,8 @@ health и в ошибке «неизвестный алиас» — а всё э
 
 * ``CODE_INDEX_EXE`` — путь к индексатору ``bsl-indexer`` (code-index); не
   задан — ищется в PATH;
+* ``CODE_INDEX_COPY_EXE`` — путь к ``code-index-copy``; не задан — рядом с
+  индексатором, иначе ищется в PATH;
 * ``CODE_INDEX_MAIN_HOME`` — каталог конфигов общего индекса (daemon.toml,
   serve.toml) для проверки изоляции; не задан — каталог индексатора;
 * ``AGENT_WORK_DIR`` — каталог копий; не задан — ``C:/Temp/agent-work``;
@@ -82,6 +87,11 @@ EXE = os.environ.get("CODE_INDEX_EXE") or shutil.which("bsl-indexer") or ""
 # проверки изоляции; сам экземпляр копии их не читает. По умолчанию — каталог
 # индексатора.
 MAIN_HOME = Path(os.environ.get("CODE_INDEX_MAIN_HOME") or (Path(EXE).parent if EXE else "."))
+# Копия с базой индекса и конфигами — программа code-index-copy (code-index 1.8.3+).
+_РЯДОМ = Path(EXE).with_name("code-index-copy.exe" if os.name == "nt" else "code-index-copy") if EXE else None
+УТИЛИТА_КОПИИ = (os.environ.get("CODE_INDEX_COPY_EXE")
+                 or (str(_РЯДОМ) if _РЯДОМ and _РЯДОМ.exists() else None)
+                 or shutil.which("code-index-copy") or "")
 КАТАЛОГ_КОПИЙ = Path("C:/Temp/agent-work") if os.name == "nt" else Path(tempfile.gettempdir()) / "agent-work"
 КОПИИ = Path(os.environ.get("AGENT_WORK_DIR") or КАТАЛОГ_КОПИЙ)
 # Конфиг хука code-index-guard: в каких каталогах он отклоняет обычное чтение
@@ -229,22 +239,8 @@ def запустить(дом_копии: Path, роль: str, аргумент�
     return p
 
 
-def запустить_индекс(копия: Path, дом_копии: Path, язык: str, порт: int, алиас: str) -> None:
-    # Значения уходят в TOML: язык — только имя, путь — экранированной строкой.
-    if not re.fullmatch(r"[A-Za-z0-9_+-]+", язык):
-        raise SystemExit(f"недопустимый --language: {язык!r}")
-    дом_копии.mkdir(parents=True, exist_ok=True)
-    путь = копия.as_posix()
-    (дом_копии / "daemon.toml").write_text(
-        "# Один репозиторий — чистая копия для исполнителя (clean_copy.py).\n"
-        "[daemon]\nhttp_port = 0\n\n"
-        f'[[paths]]\npath = {json.dumps(путь, ensure_ascii=False)}\nalias = "{алиас}"\nlanguage = "{язык}"\n',
-        encoding="utf-8")
-    (дом_копии / "serve.toml").write_text(
-        "# Единственный репозиторий, локальный, никакой федерации.\n"
-        '[me]\nip = "127.0.0.1"\n\n'
-        f'[[paths]]\nalias = "{алиас}"\nip = "127.0.0.1"\nport = {порт}\n',
-        encoding="utf-8")
+def запустить_индекс(копия: Path, дом_копии: Path, порт: int, алиас: str) -> None:
+    # Конфиги daemon.toml и serve.toml копии уже записал code-index-copy.
     # daemon.json прежнего запуска указал бы на мёртвый процесс.
     (дом_копии / "daemon.json").unlink(missing_ok=True)
     демон = запустить(дом_копии, "daemon", ["daemon", "run"])
@@ -253,7 +249,7 @@ def запустить_индекс(копия: Path, дом_копии: Path, �
         "--config", str(дом_копии / "daemon.toml"),
         "--serve-config", str(дом_копии / "serve.toml")])
     начало = time.time()
-    while time.time() - начало < 120:
+    while time.time() - начало < 180:
         time.sleep(1)
         # `daemon run` запускает рабочий процесс отдельно и сам выходит с кодом 0
         # (проверено 11.09.2026); настоящий PID демон пишет в daemon.json.
@@ -275,7 +271,7 @@ def запустить_индекс(копия: Path, дом_копии: Path, �
                   f"serve PID {serve.pid}, порт {порт}, алиас {алиас}")
             return
     остановить_индекс(дом_копии)
-    raise SystemExit("индекс копии не готов за 120 с — см. журналы в " + str(дом_копии))
+    raise SystemExit("индекс копии не готов за 180 с — см. журналы в " + str(дом_копии))
 
 
 def вызвать(порт: int, инструмент: str, аргументы: dict) -> str:
@@ -299,6 +295,46 @@ def вызвать(порт: int, инструмент: str, аргументы:
     текст, _ = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
                      "params": {"name": инструмент, "arguments": аргументы}}, сессия)
     return текст
+
+
+def создать_копию(проект: Path, копия: Path, ветка: str, sha: str, дом_копии: Path,
+                  язык: str, порт: int, алиас: str) -> None:
+    """Копия проекта на ветке ``ветка`` от коммита ``sha`` вместе с базой индекса
+    проекта и конфигами индекса копии — программой code-index-copy. При сбое она
+    сама откатывает созданное ею (копию, дом индекса, ветку) и называет шаг и
+    причину — они и уходят в текст ошибки."""
+    if not УТИЛИТА_КОПИИ:
+        raise SystemExit("не найдена программа code-index-copy: задайте CODE_INDEX_COPY_EXE, "
+                         "положите её рядом с bsl-indexer или добавьте в PATH")
+    r = subprocess.run([УТИЛИТА_КОПИИ, str(проект), str(копия), "--worktree", "--branch", ветка,
+                        "--commit", sha, "--index-home", str(дом_копии), "--port", str(порт),
+                        "--alias", алиас, "--language", язык],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    строки = [с for с in r.stdout.splitlines() if с.startswith("{")]
+    try:
+        отчёт = json.loads(строки[-1])
+    except (IndexError, ValueError):
+        raise SystemExit(f"code-index-copy завершился с кодом {r.returncode} без отчёта: "
+                         f"{(r.stderr or r.stdout).strip()[-1500:]}")
+    if r.returncode != 0 or not отчёт.get("ok"):
+        ошибка = отчёт.get("error") or {}
+        raise SystemExit(f"code-index-copy, код {r.returncode}, шаг {ошибка.get('stage')}: "
+                         f"{ошибка.get('message')}")
+    база = ("база проекта перенесена" if отчёт.get("db_transferred")
+            else f"базы нет ({отчёт.get('db_note')}) — индекс копии строится с нуля")
+    print(f"[копия] {база}; время взято из проекта у {отчёт.get('mtime_aligned')} файлов из "
+          f"{отчёт.get('files_copied')}; за {отчёт.get('timings_ms', {}).get('total', 0) / 1000:.0f} с")
+
+
+def сменить_порт(дом_копии: Path, старый: int, новый: int) -> None:
+    """Порт индекса копии в её конфигах: адрес сброса кэша в daemon.toml и порт в
+    serve.toml. Нужен, когда порт перехватили между выбором и запуском."""
+    демон = дом_копии / "daemon.toml"
+    текст = демон.read_text(encoding="utf-8")
+    демон.write_text(текст.replace(f"127.0.0.1:{старый}", f"127.0.0.1:{новый}"), encoding="utf-8")
+    выдача = дом_копии / "serve.toml"
+    выдача.write_text(re.sub(rf"(?m)^port = {старый}$", f"port = {новый}",
+                             выдача.read_text(encoding="utf-8")), encoding="utf-8")
 
 
 def чужие_метки(алиас: str) -> set[str]:
@@ -612,13 +648,9 @@ def prepare(проект: Path, имя: str, язык: str, порт: int | None
         raise SystemExit(f"ветка {ветка} уже есть — сначала снимите её или возьмите другое имя")
     sha = git("rev-parse", "--verify", f"{база}^{{commit}}", cwd=проект).strip()
     КОПИИ.mkdir(parents=True, exist_ok=True)
-    # Хуки проекта при создании копии не выполняются — как и при переносе.
-    with tempfile.TemporaryDirectory(prefix="clean-copy-hooks-") as пустые_hooks:
-        git("-c", f"core.hooksPath={пустые_hooks}", "worktree", "add", "-b", ветка,
-            str(копия), sha, cwd=проект)
+    создать_копию(проект, копия, ветка, sha, дом_копии, язык, порт, алиас)
     # Сведения о копии пишутся до запуска индекса: list и remove должны видеть
     # и копию с упавшим индексом.
-    дом_копии.mkdir(parents=True, exist_ok=True)
     сведения = {
         "name": имя,
         "project": проект.resolve().as_posix(),
@@ -634,13 +666,14 @@ def prepare(проект: Path, имя: str, язык: str, порт: int | None
         (дом_копии / "copy.json").write_text(
             json.dumps(сведения, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         try:
-            запустить_индекс(копия, дом_копии, язык, порт, алиас)
+            запустить_индекс(копия, дом_копии, порт, алиас)
             break
         except SystemExit:
             if not авто or попытка == ПОПЫТОК_ПОРТА - 1 or not порт_занят(порт):
                 raise
             новый_порт = свободный_порт()
             print(f"[индекс] порт {порт} перехвачен — беру {новый_порт}")
+            сменить_порт(дом_копии, порт, новый_порт)
             порт = новый_порт
             сведения["port"] = порт
     проверить_изоляцию(дом_копии, порт, алиас)
